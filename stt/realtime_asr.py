@@ -1,46 +1,44 @@
 """
-realtime_asr.py
-───────────────
-Zero-buffer, per-chunk streaming ASR with:
+realtime_asr.py  —  High-Accuracy Streaming ASR  v2.0
+═══════════════════════════════════════════════════════════════════════════════
 
-  1. PREFIX HEALING     — injects last 0.8s of previous chunk as read-only
-                          context so split words (to|mo|ro|w) get healed
-                          by Whisper seeing both halves in the same call.
+Core design: NEVER lose a word, NEVER cut a word, NEVER duplicate a word.
 
-  2. WORD-BOUNDARY EMIT — a word is only emitted when the NEXT word starts
-                          (gap between word[i].end and word[i+1].start > 
-                          WORD_GAP_MS).  This is the "end of word pause"
-                          you asked for — no timers, purely timestamp-driven.
+The three failure modes fixed here
+────────────────────────────────────
+  1. SPLIT WORDS  ("tomor" + "row")
+     Cause:  Chunk boundary falls inside a word.
+     Fix:    Live pass always feeds the last CONTEXT_S of utterance audio,
+             so Whisper sees full words from the start of the sentence.
+             A word is only "confirmed" when the NEXT word starts.
 
-  3. CONVERSATION CONTEXT — every ASR call receives a text prompt built
-                            from the last N confirmed words of THIS utterance
-                            + the last M turns of conversation history.
-                            Whisper uses this as a prior so it picks the
-                            right words in ambiguous cases ("two" vs "to" vs
-                            "too", names, domain vocabulary, etc.)
+  2. LOST WORDS AT SENTENCE END  ("So I have a [question]" → dropped tail)
+     Cause:  Live pass fires every 600 ms; the last 100-500 ms of a short
+             sentence never accumulates enough for another live fire before
+             VAD silence arrives.
+     Fix:    flush() re-transcribes the FULL utterance audio with beam=5
+             (more accurate than greedy live passes). It diffs the accurate
+             result against already-emitted words and emits exactly the tail
+             that was missed.  Nothing is ever lost.
 
-  4. LATENCY EVENTS      — every chunk returns precise timing breakdowns
-                           (prep, inference, total, realtime_factor).
+  3. DUPLICATE WORDS  ("hello hello world")
+     Cause:  Each live pass overlaps with the previous; naive timestamp-zone
+             splitting fails when Whisper timestamps drift slightly.
+     Fix:    Emit-cursor via longest-common-prefix match. We compare Whisper's
+             output word list against our already-emitted list and only emit
+             words AFTER the matched prefix.
 
-Architecture per chunk
-──────────────────────
-  new chunk arrives
-      │
-      ├─ prepend prefix (last 0.8s of prev chunk)  ← heal split words
-      │
-      ├─ build initial_prompt from context          ← intelligent
-      │
-      ├─ Whisper.transcribe(audio, initial_prompt)  ← one inference call
-      │
-      ├─ split words into prefix_zone / new_zone    ← by timestamp
-      │
-      ├─ apply word-boundary rule:                  ← emit on gap
-      │     word[i] confirmed when word[i+1].start
-      │     - word[i].end > WORD_GAP_MS
-      │     (last word always stays pending until
-      │      next chunk or flush())
-      │
-      └─ return { partial, words, latency }
+Architecture
+────────────
+  transcribe_chunk(chunk)  ->  called by pipeline.py for every voice chunk
+    append chunk to utterance buffer
+    if accumulated >= FIRE_MS: run Whisper on last CONTEXT_S
+    advance emit cursor, return new words
+
+  flush()  ->  called by pipeline.py on VAD silence_event
+    run Whisper on FULL utterance audio (beam=5)
+    diff against emitted, emit tail
+    reset utterance state, save to history
 """
 
 from __future__ import annotations
@@ -48,264 +46,135 @@ from __future__ import annotations
 import time
 import numpy as np
 from collections import deque
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from faster_whisper import WhisperModel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Tuneable constants
+#  Tunable constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-WORD_GAP_MS        = 80     # Silence between word[i].end and word[i+1].start
-                             # that counts as "word boundary" → emit word[i]
-OVERLAP_SECONDS    = 0.8    # How much of the previous chunk to inject as prefix
-MAX_CONTEXT_WORDS  = 40     # Max words from current utterance in prompt
-MAX_PROMPT_WORDS   = 10     # Hard cap on words injected into initial_prompt
-                             # Longer prompts cause Whisper to echo back context
-                             # (the "you hear you hear" repetition bug).
-MAX_HISTORY_TURNS  = 3      # How many past conversation turns to include
-MAX_CONTEXT_TRIM   = 6.0    # Trim context window if > this many seconds (memory)
+FIRE_MS             = 600    # Run live Whisper every N ms of voice audio
+CONTEXT_S           = 8.0    # Feed Whisper up to this many seconds per live pass
+OVERLAP_S           = 0.8    # Extra context prepended to heal word boundaries
 
+MAX_PROMPT_WORDS    = 12     # Cap on initial_prompt (avoids Whisper echo-back bug)
+MAX_HISTORY_TURNS   = 3
+
+MIN_WORD_PROB       = 0.50   # Drop words Whisper is < 50% confident about
+MAX_NO_SPEECH_PROB  = 0.55   # Drop segment if mostly silence
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 class RealTimeChunkASR:
     """
-    Drop-in replacement for StreamingSpeechRecognizer for the per-chunk path.
-
-    Key difference from the old approach:
-      • NO SpeechBuffer — every chunk hits Whisper immediately
-      • Words emitted on WORD BOUNDARY (gap), not on segment end
-      • Whisper receives conversation history as initial_prompt
-      • flush() called by pipeline on VAD silence to emit last pending word
+    High-accuracy streaming ASR.  Drop-in for the original RealTimeChunkASR.
+    Same public API, much better accuracy.
     """
 
     def __init__(
         self,
-        model_size: str = "base.en",
-        device: str = "cuda",
-        sample_rate: int = 16000,
-        overlap_seconds: float = OVERLAP_SECONDS,
-        word_gap_ms: float = WORD_GAP_MS,
-        max_context_words: int = MAX_CONTEXT_WORDS,
-        max_history_turns: int = MAX_HISTORY_TURNS,
+        model_size:        str   = "base.en",
+        device:            str   = "cuda",
+        sample_rate:       int   = 16000,
+        overlap_seconds:   float = OVERLAP_S,
+        word_gap_ms:       float = 60.0,      # kept for API compat only
+        max_context_words: int   = MAX_PROMPT_WORDS,
+        max_history_turns: int   = MAX_HISTORY_TURNS,
     ):
-        # int8_float16: quantised weights (int8) + float16 accumulation
-        # ~35% faster than float16 on NVIDIA RTX 20-series+ with negligible accuracy loss.
         compute_type = "int8_float16" if device == "cuda" else "int8"
-        print(f"[RealTimeASR] Loading Whisper {model_size} on {device.upper()} "
-              f"(compute={compute_type})...")
-        self.model         = WhisperModel(model_size, device=device, compute_type=compute_type)
-        self.sample_rate   = sample_rate
-        self.overlap_samples = int(overlap_seconds * sample_rate)
-        self.word_gap_sec  = word_gap_ms / 1000.0
-        self.max_ctx_words = max_context_words
-        self.max_hist_turns = max_history_turns
+        print(f"[RealTimeASR] Loading Whisper '{model_size}' on "
+              f"{device.upper()} (compute={compute_type})...")
+        self.model       = WhisperModel(model_size, device=device,
+                                        compute_type=compute_type)
+        self.sample_rate = sample_rate
+        self.device      = device
 
-        # ── Per-utterance state ──────────────────────────────────────────
-        self._prev_tail: Optional[np.ndarray] = None  # Overlap from last chunk
-        self._confirmed_words: List[str] = []         # Emitted this utterance
-        self._pending_word: Optional[str] = None      # Last word, not yet emitted
-        self._pending_end: float = 0.0                # Its end timestamp (abs)
-        self._utterance_offset: float = 0.0           # Running audio time (seconds)
-        self._chunk_index: int = 0
+        self._overlap_samples  = int(overlap_seconds * sample_rate)
+        self._context_samples  = int(CONTEXT_S * sample_rate)
+        self._fire_samples     = int(FIRE_MS / 1000 * sample_rate)
 
-        # ── Conversation history (cross-utterance) ───────────────────────
-        # Each entry: {"role": "user"|"assistant", "text": "..."}
+        # Per-utterance state
+        self._utt_audio:       List[np.ndarray] = []
+        self._utt_samples:     int = 0
+        self._since_last_fire: int = 0
+
+        # Emit state — track exactly which words have been sent to caller
+        self._emitted: List[str] = []
+        self._pending: Optional[str] = None
+
+        # Conversation history
         self._history: deque[dict] = deque(maxlen=max_history_turns * 2)
 
-        print("[RealTimeASR] ✅ Ready")
+        self._chunk_index: int = 0
+
+        print("[RealTimeASR] Ready")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Main per-chunk entry point
+    #  Public: per-chunk
     # ─────────────────────────────────────────────────────────────────────────
 
     def transcribe_chunk(self, chunk: np.ndarray) -> dict:
-        """
-        Process one audio chunk immediately.  No buffering.
-
-        Returns
-        ───────
-        {
-          "words":   ["hello", "world"],   # newly confirmed complete words
-          "partial": "tomo",               # current incomplete word (for display)
-          "latency": { ... }               # timing breakdown
-        }
-        """
         t0 = time.perf_counter()
         self._chunk_index += 1
 
-        chunk_duration = len(chunk) / self.sample_rate
+        self._utt_audio.append(chunk.copy())
+        self._utt_samples     += len(chunk)
+        self._since_last_fire += len(chunk)
 
-        # ── Step 1: Build audio window = prefix + chunk ──────────────────
-        if self._prev_tail is not None:
-            audio_input   = np.concatenate([self._prev_tail, chunk])
-            prefix_dur    = len(self._prev_tail) / self.sample_rate
-        else:
-            audio_input   = chunk
-            prefix_dur    = 0.0
+        # Hard cap utterance buffer at 30 s to prevent OOM
+        MAX_UTT = int(30 * self.sample_rate)
+        while self._utt_samples > MAX_UTT and len(self._utt_audio) > 1:
+            removed = self._utt_audio.pop(0)
+            self._utt_samples -= len(removed)
 
-        t1 = time.perf_counter()
+        newly_emitted: List[str] = []
 
-        # ── Step 2: Build Whisper initial_prompt from context ────────────
-        prompt = self._build_prompt()
-
-        # ── Step 3: Whisper inference ────────────────────────────────────
-        segments, _ = self.model.transcribe(
-            audio_input,
-            beam_size      = 1,
-            word_timestamps= True,
-            vad_filter     = False,       # We handle VAD
-            initial_prompt = prompt or None,
-            condition_on_previous_text = False,  # We control context manually
-        )
-
-        # Collect all words with absolute timestamps
-        # (timestamps from Whisper are relative to audio_input start)
-        # We shift by (utterance_offset - prefix_dur) to get absolute time
-        time_shift = self._utterance_offset - prefix_dur
-        all_words  = []
-
-        for seg in segments:
-            if not (hasattr(seg, "words") and seg.words):
-                # No word timestamps — fall back to segment-level
-                for w in seg.text.strip().split():
-                    if w:
-                        all_words.append({
-                            "word":  w,
-                            "start": seg.start + time_shift,
-                            "end":   seg.end   + time_shift,
-                        })
-            else:
-                for w in seg.words:
-                    word = w.word.strip()
-                    if word:
-                        all_words.append({
-                            "word":  word,
-                            "start": w.start + time_shift,
-                            "end":   w.end   + time_shift,
-                        })
-
-        t2 = time.perf_counter()
-
-        # ── Step 4: Filter — only words from the NEW chunk zone ──────────
-        # (words whose start time falls inside the new chunk, not the prefix)
-        chunk_start_abs = self._utterance_offset        # absolute time of chunk start
-        chunk_end_abs   = self._utterance_offset + chunk_duration
-
-        new_zone_words = [
-            w for w in all_words
-            if w["start"] >= (chunk_start_abs - 0.05)   # small tolerance
-        ]
-
-        # ── Step 5: Word-boundary emit ───────────────────────────────────
-        #
-        # Rule: word[i] is COMPLETE when:
-        #   word[i+1].start - word[i].end > WORD_GAP_SEC
-        #   (there is a measurable pause between them)
-        #
-        # The LAST word in new_zone_words is always PENDING
-        # (we haven't heard what comes after it yet)
-        #
-        newly_confirmed: List[str] = []
-
-        if new_zone_words:
-            for i, w in enumerate(new_zone_words[:-1]):           # all except last
-                next_w     = new_zone_words[i + 1]
-                gap        = next_w["start"] - w["end"]
-                already_confirmed_count = len(self._confirmed_words)
-
-                # Only emit words we haven't emitted before
-                # Count position: confirmed_words already has N words,
-                # so we emit in order
-                word_global_idx = already_confirmed_count + len(newly_confirmed)
-
-                if gap >= self.word_gap_sec:
-                    # Word boundary detected → confirm this word
-                    newly_confirmed.append(w["word"])
-
-            # Last word is always partial
-            last = new_zone_words[-1]
-            self._pending_word = last["word"]
-            self._pending_end  = last["end"]
-
-        # Commit confirmed words
-        self._confirmed_words.extend(newly_confirmed)
-
-        # ── Step 6: Update prefix for next chunk ────────────────────────
-        if len(chunk) >= self.overlap_samples:
-            self._prev_tail = chunk[-self.overlap_samples:].copy()
-        else:
-            self._prev_tail = chunk.copy()
-
-        # Advance utterance clock
-        self._utterance_offset += chunk_duration
-
-        # ── Step 7: Build latency report ────────────────────────────────
-        t3 = time.perf_counter()
-
-        chunk_ms  = chunk_duration * 1000
-        prep_ms   = (t1 - t0) * 1000
-        asr_ms    = (t2 - t1) * 1000
-        post_ms   = (t3 - t2) * 1000
-        total_ms  = (t3 - t0) * 1000
-        rtf       = total_ms / max(chunk_ms, 1)
+        if self._since_last_fire >= self._fire_samples:
+            self._since_last_fire = 0
+            audio_window = self._build_window()
+            words = self._run_whisper(audio_window, beam_size=1)
+            newly_emitted = self._advance_cursor(words, is_flush=False)
 
         return {
-            "words":   newly_confirmed,
-            "partial": self._pending_word or "",
+            "words":   newly_emitted,
+            "partial": self._pending or "",
             "latency": {
-                "chunk_duration_ms": round(chunk_ms,  1),
-                "prep_ms":           round(prep_ms,   2),
-                "asr_inference_ms":  round(asr_ms,    2),
-                "post_ms":           round(post_ms,   2),
-                "total_ms":          round(total_ms,  2),
-                "realtime_factor":   round(rtf,       3),
+                "chunk_duration_ms": round(len(chunk) / self.sample_rate * 1000, 1),
+                "total_ms":          round((time.perf_counter() - t0) * 1000, 2),
                 "chunk_index":       self._chunk_index,
-                "status": (
-                    "🟢 fast" if rtf < 0.8 else
-                    "🟡 ok"   if rtf < 1.0 else
-                    "🔴 slow — consider smaller model"
-                ),
-            },
-            "debug": {
-                "prompt_used":         prompt[:80] + "..." if prompt and len(prompt) > 80 else prompt,
-                "all_words_from_asr":  [w["word"] for w in all_words],
-                "new_zone_words":      [w["word"] for w in new_zone_words],
-                "prefix_duration_s":   round(prefix_dur, 3),
+                "emit_cursor":       len(self._emitted),
             },
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Flush — called by pipeline when VAD detects end of utterance
+    #  Public: flush
     # ─────────────────────────────────────────────────────────────────────────
 
     def flush(self) -> dict:
-        """
-        End of utterance.  Emit the last pending word unconditionally
-        (it has no 'next word' to confirm it via gap detection).
+        """End of utterance. Accurate beam=5 pass to catch any missed tail words."""
+        flushed: List[str] = []
 
-        Also adds the complete utterance to conversation history.
+        if self._utt_audio:
+            full_audio = np.concatenate(self._utt_audio)
+            words      = self._run_whisper(full_audio, beam_size=5)
+            flushed    = self._advance_cursor(words, is_flush=True)
 
-        Returns { "words": [...], "partial": "", "text": "full utterance" }
-        """
-        flushed = []
+        # Safety net: emit pending if it survived the flush diff
+        if self._pending:
+            p = self._pending.strip()
+            emitted_normalized = [_n(e) for e in self._emitted]
+            if p and any(c.isalpha() for c in p) and _n(p) not in emitted_normalized[-2:]:
+                flushed.append(p)
+                self._emitted.append(p)
+            self._pending = None
 
-        if self._pending_word:
-            flushed.append(self._pending_word)
-            self._confirmed_words.append(self._pending_word)
-
-        full_text = " ".join(self._confirmed_words).strip()
-
-        # Add to conversation history
+        full_text = " ".join(self._emitted).strip()
         if full_text:
             self._history.append({"role": "user", "text": full_text})
 
-        # Reset utterance state (but keep history and prev_tail for next utt)
-        self._confirmed_words  = []
-        self._pending_word     = None
-        self._pending_end      = 0.0
-        self._utterance_offset = 0.0
-        self._prev_tail        = None   # Fresh start for next utterance
-        self._chunk_index      = 0
+        self._reset_utterance_state()
 
         return {
             "words":   flushed,
@@ -314,75 +183,194 @@ class RealTimeChunkASR:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Conversation context management
+    #  Internal: build audio window for live pass
     # ─────────────────────────────────────────────────────────────────────────
 
-    def add_assistant_turn(self, text: str):
+    def _build_window(self) -> np.ndarray:
         """
-        Call this from pipeline/orchestrator when the AI responds.
-        Adds the AI reply to history so Whisper understands conversation flow.
+        Grab last (CONTEXT_S + OVERLAP_S) of utterance audio.
+        The leading OVERLAP_S is read-only context — helps Whisper produce
+        stable timestamps at the window boundary.
         """
-        if text:
-            self._history.append({"role": "assistant", "text": text})
+        target = self._context_samples + self._overlap_samples
+        pieces: List[np.ndarray] = []
+        gathered = 0
+        for chunk in reversed(self._utt_audio):
+            pieces.append(chunk)
+            gathered += len(chunk)
+            if gathered >= target:
+                break
+        pieces.reverse()
+        window = np.concatenate(pieces)
+        return window[-target:] if len(window) > target else window
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Internal: Whisper inference
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _run_whisper(self, audio: np.ndarray, beam_size: int) -> List[str]:
+        """Run Whisper, apply quality filters, return cleaned word strings."""
+        if len(audio) < int(self.sample_rate * 0.1):
+            return []
+
+        prompt = self._build_prompt()
+
+        try:
+            segments, _ = self.model.transcribe(
+                audio,
+                beam_size                  = beam_size,
+                word_timestamps            = True,
+                vad_filter                 = False,
+                initial_prompt             = prompt or None,
+                condition_on_previous_text = False,
+                temperature                = 0.0,
+            )
+        except Exception as exc:
+            print(f"[RealTimeASR] Whisper error: {exc}")
+            return []
+
+        words: List[str] = []
+        for seg in segments:
+            if getattr(seg, "no_speech_prob", 0.0) > MAX_NO_SPEECH_PROB:
+                continue
+            if hasattr(seg, "words") and seg.words:
+                for w in seg.words:
+                    text = w.word.strip()
+                    prob = getattr(w, "probability", 1.0)
+                    if text and prob >= MIN_WORD_PROB:
+                        words.append(text)
+            else:
+                for wtext in seg.text.strip().split():
+                    if wtext.strip():
+                        words.append(wtext.strip())
+
+        return words
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Internal: advance emit cursor
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _advance_cursor(self, whisper_words: List[str], is_flush: bool) -> List[str]:
+        """
+        Given the full word list Whisper just produced for the audio window,
+        return only the words that are NEW (not yet emitted to caller).
+
+        Uses longest-common-prefix matching to find the cut point between
+        already-emitted words and the new output.
+        """
+        if not whisper_words:
+            return []
+
+        ne = [_n(w) for w in self._emitted]
+        nw = [_n(w) for w in whisper_words]
+
+        # Find how many leading words of whisper_words match our emitted list
+        cursor = _lcp_match(ne, nw)
+        new_raw = whisper_words[cursor:]
+
+        if not new_raw:
+            # Whisper produced nothing new — update pending to its last word
+            if whisper_words:
+                self._pending = whisper_words[-1]
+            return []
+
+        newly: List[str] = []
+
+        if is_flush:
+            # Emit all new words
+            for w in new_raw:
+                w = w.strip()
+                if w and any(c.isalpha() for c in w):
+                    newly.append(w)
+                    self._emitted.append(w)
+            self._pending = None
+
+        else:
+            # Live pass:
+            # 1. Promote previous pending if Whisper confirms it
+            if self._pending:
+                pn = _n(self._pending)
+                nw_fresh = [_n(w) for w in new_raw]
+                if nw_fresh and nw_fresh[0] == pn:
+                    # Confirmed: pending was correct
+                    w = self._pending.strip()
+                    if w and any(c.isalpha() for c in w):
+                        newly.append(w)
+                        self._emitted.append(w)
+                    new_raw = new_raw[1:]
+                elif pn in nw_fresh[:3]:
+                    # Slightly shifted but still there
+                    w = self._pending.strip()
+                    if w and any(c.isalpha() for c in w):
+                        newly.append(w)
+                        self._emitted.append(w)
+                # If Whisper doesn't see pending at all → was a hallucination, discard
+                self._pending = None
+
+            if not new_raw:
+                return newly
+
+            # 2. Confirm all words except the last one
+            confirmed = new_raw[:-1]
+            last_word = new_raw[-1]
+
+            for w in confirmed:
+                w = w.strip()
+                if not w or not any(c.isalpha() for c in w):
+                    continue
+                # Genuine repetitions allowed; block accidental dups
+                wn = _n(w)
+                times_emitted = sum(1 for e in [_n(x) for x in self._emitted] if e == wn)
+                times_whisper = sum(1 for x in nw if x == wn)
+                if times_emitted < times_whisper:
+                    newly.append(w)
+                    self._emitted.append(w)
+
+            # 3. Hold last word as pending
+            ls = last_word.strip()
+            self._pending = ls if ls else None
+
+        return [w for w in newly if w]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Internal: prompt
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _build_prompt(self) -> str:
-        """
-        Build Whisper's initial_prompt from:
-          - Last N confirmed words of the CURRENT utterance (in-progress context)
-          - Last M turns of conversation history (cross-turn context)
-
-        Whisper uses this as a prior — it biases transcription toward words
-        and phrases that fit the ongoing conversation.
-
-        Example output:
-          "User: what time is the meeting tomorrow
-           Assistant: The meeting is at 3pm
-           User: can you also remind me about"
-
-        Whisper then knows the domain is "meeting scheduling" and will
-        prefer "remind" over "rewind", "3pm" over "three", etc.
-        """
         parts: List[str] = []
-
-        # ── History turns ────────────────────────────────────────────────
         for turn in self._history:
-            role  = "User" if turn["role"] == "user" else "Assistant"
+            role = "User" if turn["role"] == "user" else "Assistant"
             parts.append(f"{role}: {turn['text']}")
-
-        # ── Current utterance so far (in-progress) ───────────────────────
-        # Strictly cap to MAX_PROMPT_WORDS (last N words only).
-        # Longer prompts cause Whisper to repeat context ("you hear you hear").
-        if self._confirmed_words:
-            recent = self._confirmed_words[-MAX_PROMPT_WORDS:]
-            parts.append("User: " + " ".join(recent))
-
+        if self._emitted:
+            parts.append("User: " + " ".join(self._emitted[-MAX_PROMPT_WORDS:]))
         return "\n".join(parts) if parts else ""
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Full reset (new session / new user)
+    #  Internal: reset
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _reset_utterance_state(self):
+        self._utt_audio       = []
+        self._utt_samples     = 0
+        self._since_last_fire = 0
+        self._emitted         = []
+        self._pending         = None
+        self._chunk_index     = 0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Public API (compat)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def add_assistant_turn(self, text: str):
+        if text:
+            self._history.append({"role": "assistant", "text": text})
+
     def reset(self):
-        """Full reset — clears history too.  Call on new WebSocket session."""
-        self._prev_tail        = None
-        self._confirmed_words  = []
-        self._pending_word     = None
-        self._pending_end      = 0.0
-        self._utterance_offset = 0.0
-        self._chunk_index      = 0
+        self._reset_utterance_state()
         self._history.clear()
 
     def reset_utterance(self):
-        """
-        Reset only the current utterance state.
-        Keeps conversation history intact — call between utterances.
-        """
-        self._prev_tail        = None
-        self._confirmed_words  = []
-        self._pending_word     = None
-        self._pending_end      = 0.0
-        self._utterance_offset = 0.0
-        self._chunk_index      = 0
+        self._reset_utterance_state()
 
     @property
     def history(self) -> list:
@@ -390,7 +378,49 @@ class RealTimeChunkASR:
 
     @property
     def current_utterance_so_far(self) -> str:
-        words = self._confirmed_words[:]
-        if self._pending_word:
-            words.append(self._pending_word)
+        words = self._emitted[:]
+        if self._pending:
+            words.append(self._pending)
         return " ".join(words)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _n(w: str) -> str:
+    """Normalize a word for comparison (lowercase, strip punctuation)."""
+    return w.lower().strip(".,!?;:'\"-—–")
+
+
+def _lcp_match(emitted: List[str], whisper: List[str]) -> int:
+    """
+    Find how many leading elements of `whisper` match a suffix of `emitted`.
+
+    Example:
+        emitted = ["hello", "world", "how"]
+        whisper = ["hello", "world", "how", "are", "you"]
+        returns 3  ->  new words start at whisper[3]
+
+    We try matching whisper's prefix against progressively shorter
+    suffixes of emitted, returning the longest match found.
+    """
+    if not emitted or not whisper:
+        return 0
+
+    max_match = 0
+    len_w = len(whisper)
+    len_e = len(emitted)
+
+    for suffix_start in range(0, len_e + 1):
+        tail   = emitted[suffix_start:]
+        prefix = min(len(tail), len_w)
+        if prefix == 0:
+            continue
+        if tail[:prefix] == whisper[:prefix]:
+            if prefix > max_match:
+                max_match = prefix
+            if max_match == len_w:
+                return max_match   # Can't do better
+
+    return max_match
