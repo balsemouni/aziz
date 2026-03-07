@@ -95,6 +95,10 @@ LATENCY_LOG_LEVEL    = os.getenv("LATENCY_LOG_LEVEL",        "info")
 STT_SILENCE_MS       = float(os.getenv("STT_SILENCE_MS",    "600"))
 TTS_MAX_PARALLEL     = int(os.getenv("TTS_MAX_PARALLEL",     "4"))
 
+# Test/development mode — skips voice enrollment and accepts inject_query frames
+# Set TEST_MODE=1 to enable. NEVER enable in production.
+TEST_MODE = os.getenv("TEST_MODE", "0").strip() in ("1", "true", "yes")
+
 WS_PING_INTERVAL = 15
 WS_PING_TIMEOUT  = 20
 
@@ -765,6 +769,7 @@ class GatewaySession:
         self._last_query_time : float         = time.monotonic()
         self._last_pong_time  : float         = time.monotonic()
         self._barge_in_until  : float         = 0.0
+        self._post_enroll_until: float        = 0.0   # ignore STT until this time post-enrollment
 
         # v9: voice enrollment
         self._voice = VoiceEnrollment()
@@ -826,6 +831,8 @@ class GatewaySession:
     # ── client audio / control ────────────────────────────────────────────────
 
     def push_audio(self, frame: bytes):
+        # Any audio from the client resets the heartbeat timer (client is alive)
+        self._last_pong_time = time.monotonic()
         # During enrollment we also feed audio directly to the voice enroller
         # so the fingerprint is built from real raw audio, not just text events.
         payload = frame[1:]  # strip frame-type byte
@@ -974,37 +981,45 @@ class GatewaySession:
                         if not text:
                             return
 
+                        # ── Post-enrollment cooldown ───────────────────────────
+                        # Prevent the enrollment audio's silence-timer from firing
+                        # a second time and treating the enrollment word as a query.
+                        if time.monotonic() < self._post_enroll_until:
+                            log.info(f"[{self.sid}] Post-enroll cooldown — dropping: {text!r}")
+                            word_buf = []
+                            return
+
                         # ── Enrollment gate ───────────────────────────────────
                         if self.state == State.ENROLLING:
-                            # First utterance → enroll voice from accumulated audio
                             if not self._voice.enrolled:
-                                # The raw audio was already fed in push_audio().
-                                # If we haven't finished building the voiceprint yet
-                                # (e.g. silence trigger fired too early), force-complete
-                                # enrollment using whatever we have.
                                 if self._segment_audio_buf:
                                     combined = b"".join(self._segment_audio_buf)
                                     self._voice.add_enrollment_frame(combined)
                                     self._segment_audio_buf = []
-                                # Mark enrolled
                                 if not self._voice.enrolled:
-                                    # Still not enough — just mark enrolled so we proceed
                                     self._voice._enrolled = True
                             log.info(f"[{self.sid}] ✅ Voice enrolled from first utterance: {text!r}")
                             self.state = State.IDLE
+                            # Cooldown: ignore all STT events for 1.5s to prevent the
+                            # enrollment audio's silence-timer from double-firing into CAG
+                            self._post_enroll_until = time.monotonic() + 1.5
                             await self._jsend({"type": "enrolled", "message": "Voice enrolled. You may now speak."})
                             guard.reset()
-                            # The enrollment sentence also counts as the first query
-                            enroll_turn_id = str(uuid.uuid4())
-                            self._lat.new_turn(enroll_turn_id, text)
-                            await self._query_q.put((enroll_turn_id, text))
-                            return
+                            word_buf = []
+                            return   # do NOT queue enrollment sentence to CAG
 
                         # ── Voice verification (post-enrollment) ──────────────
                         voice_ok = self._is_enrolled_voice()
                         if not voice_ok:
                             log.info(f"[{self.sid}] 🚫 Voice mismatch — dropping segment (echo/noise): {text!r}")
                             await self._jsend({"type": "voice_mismatch", "detail": "Audio did not match enrolled voice"})
+                            return
+
+                        # Drop single-word segments when IDLE — likely residual echo or
+                        # microphone transient after enrollment/TTS end. Real user queries
+                        # have at least 2 words. (Barge-in has its own BARGE_IN_MIN_WORDS check.)
+                        if word_count < 2 and self.state == State.IDLE:
+                            log.info(f"[{self.sid}] Dropping single-word IDLE segment (likely echo): {text!r}")
                             return
 
                         guard.reset()
@@ -1081,6 +1096,11 @@ class GatewaySession:
                             word_buf.clear()
                             guard.reset()
 
+                            # ── Post-enrollment cooldown ──────────────────────
+                            if time.monotonic() < self._post_enroll_until:
+                                log.info(f"[{self.sid}] Post-enroll cooldown (segment) — dropping: {text!r}")
+                                continue
+
                             # ── Enrollment gate ───────────────────────────────
                             if self.state == State.ENROLLING:
                                 if not self._voice.enrolled:
@@ -1092,17 +1112,20 @@ class GatewaySession:
                                         self._voice._enrolled = True
                                 log.info(f"[{self.sid}] ✅ Voice enrolled (segment): {text!r}")
                                 self.state = State.IDLE
+                                self._post_enroll_until = time.monotonic() + 1.5
                                 await self._jsend({"type": "enrolled", "message": "Voice enrolled. You may now speak."})
-                                enroll_turn_id = str(uuid.uuid4())
-                                self._lat.new_turn(enroll_turn_id, text)
-                                await self._query_q.put((enroll_turn_id, text))
-                                continue
+                                continue   # do NOT queue enrollment sentence to CAG
 
                             # ── Voice verification ────────────────────────────
                             voice_ok = self._is_enrolled_voice()
                             if not voice_ok:
                                 log.info(f"[{self.sid}] 🚫 Segment dropped (voice mismatch): {text!r}")
                                 await self._jsend({"type": "voice_mismatch", "detail": "Audio did not match enrolled voice"})
+                                continue
+
+                            # Single-word IDLE segments are likely residual echo
+                            if word_count < 2 and self.state == State.IDLE:
+                                log.info(f"[{self.sid}] Dropping single-word IDLE segment (echo): {text!r}")
                                 continue
 
                             seg_turn_id = str(uuid.uuid4())
@@ -1170,6 +1193,13 @@ class GatewaySession:
                 log.info(f"[{self.sid}] CAG query [turn:{turn_id[:8]}]: {query!r}")
                 await self._jsend({"type": "thinking", "turn_id": turn_id})
 
+                # Reset CAG session on the very first turn of each gateway session
+                # so stale conversation context from a previous connection is cleared.
+                is_first_turn = not hasattr(self, '_cag_turn_count')
+                if is_first_turn:
+                    self._cag_turn_count = 0
+                self._cag_turn_count += 1
+
                 # Use TonalAccumulator for prosody-aware chunking
                 acc              = TonalAccumulator()
                 acc.reset()
@@ -1182,7 +1212,7 @@ class GatewaySession:
                         "POST", "/chat/stream",
                         json={
                             "message":       query,
-                            "reset_session": False,
+                            "reset_session": self._cag_turn_count == 1,   # True only on session's first turn
                             "turn_id":       turn_id,
                         },
                         headers={"Accept": "text/event-stream"},
@@ -1487,7 +1517,7 @@ class GatewaySession:
                 log.info(f"[{self.sid}] play_worker: TURN_END — expecting {total_expected} chunks, received {chunks_received}")
                 await _flush_in_order()
                 # Only finalize if all chunks have already arrived
-                if chunks_received >= total_expected:
+                if total_expected == 0 or chunks_received >= total_expected:
                     await _finalize_turn()
                 continue
 
@@ -1507,8 +1537,11 @@ class GatewaySession:
             await _flush_in_order()
 
             # If TURN_END already arrived and we now have all chunks → finalize
-            if total_expected >= 0 and chunks_received >= total_expected and not reorder_buf:
-                await _finalize_turn()
+            if total_expected >= 0 and chunks_received >= total_expected:
+                # Flush any remaining out-of-order chunks before finalizing
+                await _flush_in_order()
+                if not reorder_buf:
+                    await _finalize_turn()
 
 
 # ─── WebSocket endpoint ───────────────────────────────────────────────────────
@@ -1519,6 +1552,16 @@ async def ws_endpoint(ws: WebSocket):
     session  = GatewaySession(ws)
     pipeline = asyncio.create_task(session.run())
     log.info(f"[{session.sid}] client connected")
+
+    # TEST_MODE: skip enrollment, go straight to IDLE
+    if TEST_MODE:
+        session.state          = State.IDLE
+        session._voice._enrolled = True
+        log.info(f"[{session.sid}] TEST_MODE: enrollment skipped")
+        await ws.send_json({"type": "enrolling",
+                            "message": "TEST MODE — enrollment skipped"})
+        await ws.send_json({"type": "enrolled",
+                            "message": "TEST MODE — voice enrolled automatically"})
 
     try:
         async for raw in ws.iter_bytes():
@@ -1542,6 +1585,21 @@ async def ws_endpoint(ws: WebSocket):
                 elif mtype in ("ai_state", "ai_reference", "reset_context",
                                "assistant_turn", "re_enroll"):
                     session.push_control(payload)
+                elif mtype == "inject_query":
+                    # TEST MODE: push a text query directly into the CAG pipeline,
+                    # bypassing STT and voice verification entirely.
+                    if not TEST_MODE:
+                        await ws.send_json({"type": "error",
+                                            "detail": "inject_query requires TEST_MODE=1"})
+                    else:
+                        text = ctrl.get("text", "").strip()
+                        if text:
+                            turn_id = str(uuid.uuid4())
+                            session._lat.new_turn(turn_id, text)
+                            session._lat.on_stt_segment()
+                            await ws.send_json({"type": "segment", "text": text})
+                            await session._query_q.put((turn_id, text))
+                            log.info(f"[{session.sid}] inject_query: {text!r}")
                 elif mtype == "get_stats":
                     await ws.send_json({
                         "type":     "stats",

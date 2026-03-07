@@ -174,6 +174,11 @@ _last_lat: dict = {}
 _turn_count  = 0
 _barge_count = 0
 
+# ── Live mic visualizer ───────────────────────────────────────────────────────
+_mic_rms        = 0.0          # updated every mic callback
+_mic_rms_lock   = threading.Lock()
+_mic_viz_active = False        # set True once mic is open
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOW-LATENCY AUDIO OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,8 +230,14 @@ def _drain_audio_output():
 
 def _mic_cb(indata, frames, time_info, status):
     import time as _time
-    global _ai_speaking, _ai_speaking_since
+    global _ai_speaking, _ai_speaking_since, _mic_rms
     chunk = indata[:, 0].copy().astype(np.float32)
+
+    # always update live RMS for visualizer
+    rms = float(np.sqrt(np.mean(chunk ** 2)))
+    with _mic_rms_lock:
+        _mic_rms = rms
+
     if _ai_speaking:
         # Hard-mute for the first AI_SPEAKING_MUTE_S after TTS starts
         # so the initial loud burst can't leak into STT.
@@ -324,6 +335,110 @@ def _print_session_summary(summary: dict):
             continue
         print(f"  {c(BOLD, label)}  avg {_fmt_ms(st.get('avg'))}  p95 {_fmt_ms(st.get('p95'))}")
     print()
+
+
+# ── Mic Visualizer (background thread) ───────────────────────────────────────
+# Draws a single animated status line just below the header, updating in-place.
+# Uses ANSI save/restore cursor so normal print() output scrolls naturally above.
+
+_VIZ_WIDTH   = 28          # number of bar segments
+_VIZ_FPS     = 20          # redraws per second
+_VIZ_DECAY   = 0.75        # smoothing factor (higher = slower decay)
+_VIZ_FLOOR   = 0.0015      # always show a tiny heartbeat pulse
+_VIZ_SCALE   = 18.0        # RMS → bar amplitude scale
+
+_PHASE_COLORS = {
+    "CONNECTING":  DIM,
+    "ENROLLING":   YLW + BOLD,
+    "IDLE":        GRN,
+    "THINKING":    CYN + BOLD,
+    "SPEAKING":    MAG + BOLD,
+    "INTERRUPTED": RED + BOLD,
+}
+
+_PHASE_ICONS = {
+    "CONNECTING":  "○",
+    "ENROLLING":   "◎",
+    "IDLE":        "◉",
+    "THINKING":    "◈",
+    "SPEAKING":    "◆",
+    "INTERRUPTED": "⚡",
+}
+
+def _mic_viz_thread():
+    """Continuously redraws a mic level bar on its own line using ANSI tricks."""
+    import time, math, sys
+
+    SAVE    = "\033[s"
+    RESTORE = "\033[u"
+    UP      = "\033[1A"
+    CLR     = "\033[2K"
+    HIDE    = "\033[?25l"
+    SHOW    = "\033[?25h"
+
+    # Reserve a blank line right where we start — we'll always redraw here
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    smooth_rms  = 0.0
+    tick        = 0
+    interval    = 1.0 / _VIZ_FPS
+
+    while _mic_viz_active:
+        t0 = time.monotonic()
+
+        with _mic_rms_lock:
+            raw = _mic_rms
+
+        # Smooth with decay
+        target     = max(raw, _VIZ_FLOOR + 0.001 * math.sin(tick * 0.4) * 0.5)
+        smooth_rms = max(smooth_rms * _VIZ_DECAY, target)
+
+        # Build bar
+        level     = min(smooth_rms * _VIZ_SCALE, 1.0)
+        filled    = int(level * _VIZ_WIDTH)
+        remainder = level * _VIZ_WIDTH - filled
+
+        phase     = _phase
+        pcol      = _PHASE_COLORS.get(phase, DIM)
+        picon     = _PHASE_ICONS.get(phase, "●")
+
+        # Color transitions: green → yellow → orange → red
+        if level < 0.35:
+            bar_col = GRN
+        elif level < 0.65:
+            bar_col = YLW
+        elif level < 0.85:
+            bar_col = MAG
+        else:
+            bar_col = RED + BOLD
+
+        bar_chars  = "▏▎▍▌▋▊▉█"
+        bar        = "█" * filled
+        if filled < _VIZ_WIDTH and remainder > 0.1:
+            sub_idx = int(remainder * len(bar_chars))
+            bar    += bar_chars[min(sub_idx, len(bar_chars)-1)]
+            bar     = bar[:_VIZ_WIDTH]
+        bar        = bar.ljust(_VIZ_WIDTH, "░")
+
+        label = f"  🎙  {picon} {phase:<12}"
+        viz   = f"{bar_col}{bar}{R}"
+        db_val = 20 * math.log10(max(smooth_rms, 1e-9))
+        db_str = f"{db_val:+.0f}dB"
+
+        line = f"\r{pcol}{label}{R}  {viz}  {DIM}{db_str}{R}  "
+
+        # Move up one line, overwrite, move back
+        sys.stdout.write(f"{UP}{CLR}{line}\n")
+        sys.stdout.flush()
+
+        tick += 1
+        elapsed = time.monotonic() - t0
+        time.sleep(max(0.0, interval - elapsed))
+
+    # Clean up the reserved line when done
+    sys.stdout.write(f"{UP}{CLR}")
+    sys.stdout.flush()
 
 
 # ── Sender ─────────────────────────────────────────────────────────────────────
@@ -483,6 +598,13 @@ async def _receiver(ws):
             _stop.set()
 
         # ── misc ──────────────────────────────────────────────────────────────
+        elif t == "ping":
+            # Respond immediately so gateway heartbeat doesn't time out
+            try:
+                await ws.send(b'\x02' + json.dumps({"type": "pong"}).encode())
+            except Exception:
+                pass
+
         elif t == "hallucination_reset":
             _end_inline()
             print(f"  {c(YLW, '⚠ hallucination reset')}")
@@ -537,10 +659,20 @@ async def _main():
                 callback=_mic_cb,
             ):
                 print(f"  {c(GRN + BOLD, '🎤 Mic open')}\n")
+
+                # Start live mic visualizer
+                global _mic_viz_active
+                _mic_viz_active = True
+                viz_thread = threading.Thread(target=_mic_viz_thread, daemon=True)
+                viz_thread.start()
+
                 await asyncio.gather(
                     _sender(ws),
                     _receiver(ws),
                 )
+
+                _mic_viz_active = False
+                viz_thread.join(timeout=0.5)
 
     except ConnectionRefusedError:
         print(c(RED, f"\n  Cannot connect to {GW_URL}"))
