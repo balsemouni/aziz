@@ -1,50 +1,64 @@
 """
-speaker_enrollment.py  (v6 — First-Chunk Instant Enrollment)
-─────────────────────────────────────────────────────────────
+speaker_enrollment.py  (v7 — First-Sentence Enrollment)
+─────────────────────────────────────────────────────────
 Design goal
 ───────────
-Lock the speaker profile on the VERY FIRST voice chunk that passes the
-VAD + RMS gate, even if it is a single short word.  ASR is unblocked
-immediately on that same chunk — zero enrollment latency.
+Build the speaker profile from the user's FIRST COMPLETE SENTENCE (i.e. all
+voice chunks collected until the first silence_event), then lock ASR to that
+voice permanently.  Any subsequent speech that does not match that voiceprint
+is silently rejected — ASR never sees it.
 
 How it works
 ────────────
-• No accumulation window.  Each incoming voice chunk is embedded directly
-  using _extract_mfcc_full() with aggressive zero-padding so even a 20ms
-  chunk produces a valid (39,) feature vector.
+Phase 1 — COLLECTING (not yet enrolled)
+  • Every voice chunk with rms ≥ RMS_FLOOR is appended to an internal buffer.
+  • ASR is NOT fed during this phase (send_to_asr=False).
+  • The pipeline calls evaluate(..., silence_event=True) when the first pause
+    is detected.  At that point:
+      - All buffered chunks are concatenated into one audio segment.
+      - _extract_mfcc_full() is called on the full segment → robust 39-dim
+        centroid that spans many phonemes (unlike v6's single-chunk anchor).
+      - _lock_profile() is called and the buffer is cleared.
+      - The decision has send_to_asr=False and enrolled=True so the pipeline
+        can replay the pre-enroll buffer into ASR.
 
-• On the first qualifying chunk (_locked = False, is_voice = True,
-  rms > RMS_FLOOR) the embedding is computed and _lock_profile() is
-  called immediately.  The chunk is also forwarded to ASR (send_to_asr=True).
+Phase 2 — ENROLLED (profile locked)
+  • Each incoming voice chunk goes through the standard two-layer similarity
+    check (anchor + adaptive).
+  • Accepted chunks are forwarded to ASR (send_to_asr=True).
+  • Rejected chunks fire reason="speaker_mismatch" and block ASR.
+  • The adaptive profile drifts slowly so the system adjusts to the speaker
+    over the session (EMA with adapt_rate=0.05).
 
-• Subsequent chunks use the normal two-layer similarity check
-  (anchor + adaptive) exactly as in v5.
+Integration with pipeline.py (no changes needed in pipeline)
+─────────────────────────────────────────────────────────────
+  pipeline.py already handles the just_locked transition:
+    - It accumulates voice chunks in _pre_enroll_buffer during Phase 1.
+    - On the first decision with enrolled=True it replays those chunks into ASR.
+  The only change you must make in pipeline.py is to pass silence_event into
+  evaluate():
 
-• The adaptive profile continues to drift slowly so the system adjusts
-  to the speaker's voice over the session.
+    decision = self.enrollment.evaluate(
+        audio, is_voice=is_voice, silence_event=silence_event
+    )
 
-Trade-off vs v5
-───────────────
-v5 collected 2–6 s to build a robust centroid across many phonemes.
-v6 locks on one chunk — the anchor may represent only one phoneme, so
-similarity_threshold and anchor_slack are loosened slightly:
-  adaptive_threshold = 0.65  (was 0.75)
-  anchor_slack       = 0.25  (was 0.20)  →  anchor = 0.40
-This avoids false rejections when the first word (e.g. "yes") differs
-spectrally from follow-up speech.
+  (The old signature had no silence_event arg — add it as shown above.)
+
+Parameters you can tune in __init__
+────────────────────────────────────
+  similarity_threshold  float  0.72   Main gate (raised vs v6 because the anchor
+                                      now covers a full sentence → better centroid)
+  anchor_slack          float  0.20   anchor_threshold = 0.72 − 0.20 = 0.52
+  adapt_rate            float  0.05   EMA blend rate for adaptive profile
+  adapt_min_chunks      int    5      Start adapting after 5 accepted chunks
+  min_enroll_chunks     int    3      Need at least 3 voice chunks before locking
+                                      (guard against locking on a single cough)
 
 Feature vector layout  (shape 39)
 ──────────────────────────────────
   [  0:13 ]  mean MFCCs    (c0–c12)
   [ 13:26 ]  mean deltas
   [ 26:39 ]  mean delta²
-
-Parameters you can tune in __init__
-────────────────────────────────────
-  similarity_threshold  float  0.65   Main gate (loosened for 1-chunk enroll)
-  anchor_slack          float  0.25   anchor = threshold − slack  → 0.40
-  adapt_rate            float  0.05   Slightly faster drift than v5
-  adapt_min_chunks      int    3      Start adapting sooner
 """
 
 from __future__ import annotations
@@ -67,11 +81,15 @@ except ImportError:
 #  Configuration defaults
 # ─────────────────────────────────────────────────────────────────────────────
 
-SIMILARITY_THRESHOLD = 0.65   # Loosened: anchor covers only 1 chunk phoneme
-ANCHOR_SLACK         = 0.25   # anchor threshold = 0.65 − 0.25 = 0.40
-ADAPT_RATE           = 0.05   # Slightly faster drift to cover more phonemes early
-ADAPT_MIN_CHUNKS     = 3      # Start adapting after only 3 accepted chunks
-RMS_FLOOR            = 0.008  # Skip truly silent / noise-only chunks
+SIMILARITY_THRESHOLD = 0.72   # Raised vs v6: full-sentence centroid is more reliable
+ANCHOR_SLACK         = 0.20   # anchor_threshold = 0.72 − 0.20 = 0.52
+ADAPT_RATE           = 0.05
+ADAPT_MIN_CHUNKS     = 5
+RMS_FLOOR            = 0.020  # Real speech RMS is 0.02+; noise is typically below this
+MIN_ENROLL_CHUNKS    = 8      # Need at least 8 real voice chunks (~500ms at 16kHz/chunk)
+MIN_ENROLL_SECONDS   = 1.5    # Must collect at least 1.5s of qualifying speech
+MIN_VAD_PROB_ENROLL  = 0.50   # VAD confidence must be >= 0.50 to count during enrollment
+MIN_CONSECUTIVE_VOICE= 2      # Chunk must follow at least 1 other voice chunk (anti-spike)
 
 N_MFCC               = 13
 WINLEN               = 0.025
@@ -86,11 +104,10 @@ def _extract_mfcc_full(audio: np.ndarray, sample_rate: int) -> np.ndarray:
     """
     Returns shape (39,) = mean(MFCC) + mean(delta) + mean(delta²).
 
-    v6: Pads aggressively to at least 200ms so even a single 20ms streaming
-    chunk produces a valid 39-dim feature vector.  The zero-padding only
-    mildly pulls mean values toward zero — acceptable for instant enrollment.
+    Works on any length — pads to at least 200ms so even a short chunk
+    produces a valid embedding.  For full-sentence audio this is not needed
+    but the guard is kept for robustness.
     """
-    # Pad to at least 200ms — guarantees enough frames for delta/delta2
     min_len = max(int(sample_rate * 0.20), int(sample_rate * WINLEN * 4))
     if len(audio) < min_len:
         audio = np.pad(audio, (0, min_len - len(audio)))
@@ -107,17 +124,13 @@ def _extract_mfcc_full(audio: np.ndarray, sample_rate: int) -> np.ndarray:
         ceplifter    = 22,
         appendEnergy = True,
     )
-    # mfcc shape: (n_frames, 13)
 
     if mfcc.shape[0] < 3:
-        # Too few frames for delta — return mean-only (13,)
         return mfcc.mean(axis=0).astype(np.float32)
 
-    # Compute delta and delta-delta using simple finite differences
-    delta   = _compute_delta(mfcc)     # (n_frames, 13)
-    delta2  = _compute_delta(delta)    # (n_frames, 13)
+    delta  = _compute_delta(mfcc)
+    delta2 = _compute_delta(delta)
 
-    # Stack: mean across time → (39,)
     feat = np.concatenate([
         mfcc.mean(axis=0),
         delta.mean(axis=0),
@@ -128,11 +141,6 @@ def _extract_mfcc_full(audio: np.ndarray, sample_rate: int) -> np.ndarray:
 
 
 def _compute_delta(features: np.ndarray, N: int = 2) -> np.ndarray:
-    """
-    Compute delta features using the standard regression formula.
-    N = number of frames on each side.
-    Edges are padded by replication.
-    """
     n_frames, n_feats = features.shape
     padded = np.pad(features, ((N, N), (0, 0)), mode="edge")
     denom  = 2 * sum(i**2 for i in range(1, N + 1))
@@ -146,13 +154,11 @@ def _compute_delta(features: np.ndarray, N: int = 2) -> np.ndarray:
 def _extract_spectral(audio: np.ndarray) -> np.ndarray:
     """
     Returns shape (8,) — richer spectral fallback when psf is not installed.
-    Uses 6 log-spaced frequency bands + RMS + zero-crossing rate.
     """
     n     = len(audio)
     spec  = np.abs(np.fft.rfft(audio))
     freqs = np.fft.rfftfreq(n)
 
-    # 6 log-spaced band boundaries (0–8kHz at 16kHz SR)
     bands = np.logspace(np.log10(0.01), np.log10(0.5), 7)
     band_energies = []
     for i in range(len(bands) - 1):
@@ -163,16 +169,14 @@ def _extract_spectral(audio: np.ndarray) -> np.ndarray:
         else:
             band_energies.append(0.0)
 
-    rms  = float(np.sqrt(np.mean(audio ** 2) + 1e-9))
-    zcr  = float(np.mean(np.abs(np.diff(np.sign(audio)))) / 2)
+    rms = float(np.sqrt(np.mean(audio ** 2) + 1e-9))
+    zcr = float(np.mean(np.abs(np.diff(np.sign(audio)))) / 2)
 
     return np.array(band_energies + [rms, zcr], dtype=np.float32)
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if a.shape != b.shape:
-        # Shape mismatch can happen during transition from 13→39 feature size;
-        # fall back to comparing the shared prefix only.
         min_len = min(len(a), len(b))
         a, b = a[:min_len], b[:min_len]
     norm_a = np.linalg.norm(a)
@@ -183,7 +187,6 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _extract(audio: np.ndarray, sample_rate: int, use_mfcc: bool) -> np.ndarray:
-    """Unified extractor dispatch."""
     if use_mfcc:
         return _extract_mfcc_full(audio, sample_rate)
     return _extract_spectral(audio)
@@ -195,16 +198,16 @@ def _extract(audio: np.ndarray, sample_rate: int, use_mfcc: bool) -> np.ndarray:
 
 class SpeakerEnrollmentService:
     """
-    Robust adaptive two-layer speaker enrollment (v5).
+    First-sentence speaker enrollment (v7).
 
-    Key improvements over v4
-    ────────────────────────
-    • 39-dim features (MFCC + delta + delta²) instead of 13-dim mean-only
-    • Enrollment builds from per-chunk embeddings, not raw audio concat
-    • Minimum enrollment duration raised to 2.0s
-    • Quality gate: rejects enrollment chunks that are too short or too quiet
-    • Thresholds recalibrated for 39-dim feature space
-    • Slower adapt rate (3%) for more stable post-enrollment profiles
+    Phase 1 — COLLECTING:
+      Accumulates voice chunks until the first silence_event.
+      ASR is blocked during this phase.
+      On silence_event the full first sentence is used to build the anchor profile.
+
+    Phase 2 — ENROLLED:
+      Two-layer similarity check (anchor + adaptive) on every incoming chunk.
+      Only matching chunks are forwarded to ASR.
     """
 
     def __init__(
@@ -214,35 +217,46 @@ class SpeakerEnrollmentService:
         anchor_slack: float         = ANCHOR_SLACK,
         adapt_rate: float           = ADAPT_RATE,
         adapt_min_chunks: int       = ADAPT_MIN_CHUNKS,
+        min_enroll_chunks: int      = MIN_ENROLL_CHUNKS,
+        min_enroll_seconds: float   = MIN_ENROLL_SECONDS,
+        min_vad_prob: float         = MIN_VAD_PROB_ENROLL,
+        min_consecutive_voice: int  = MIN_CONSECUTIVE_VOICE,
     ):
         self.sample_rate          = sample_rate
         self.similarity_threshold = similarity_threshold
         self.anchor_threshold     = max(0.0, similarity_threshold - anchor_slack)
         self.adapt_rate           = adapt_rate
         self.adapt_min_chunks     = adapt_min_chunks
+        self.min_enroll_chunks       = min_enroll_chunks
+        self.min_enroll_seconds      = min_enroll_seconds
+        self.min_vad_prob             = min_vad_prob
+        self.min_consecutive_voice   = min_consecutive_voice
 
-        # ── Internal state ─────────────────────────────────────────────────
-        self._locked: bool                        = False
-        self._use_mfcc: bool                      = PSF_AVAILABLE
+        self._locked: bool                         = False
+        self._use_mfcc: bool                       = PSF_AVAILABLE
 
-        # Layer 1: immutable anchor (locked on first voice chunk)
         self._anchor_profile: Optional[np.ndarray]   = None
-        # Layer 2: adaptive profile (starts = anchor, drifts with each accepted chunk)
         self._adaptive_profile: Optional[np.ndarray] = None
 
+        # ── Phase 1 buffer: voice chunks for first sentence ────────────────
+        self._enroll_buffer: List[np.ndarray] = []
+        self._enroll_chunk_count: int         = 0   # qualifying voice chunks seen
+        self._enroll_audio_seconds: float     = 0.0 # total qualifying speech seconds
+        self._consec_voice_count: int         = 0   # consecutive voice chunks (anti-spike)
+
         # ── Stats ──────────────────────────────────────────────────────────
-        self.enrolled_seconds: float  = 0.0
-        self.last_similarity:  float  = 1.0
-        self.last_anchor_sim:  float  = 1.0
-        self.chunks_accepted:  int    = 0
-        self.chunks_rejected:  int    = 0
-        self._adapt_count:     int    = 0
+        self.enrolled_seconds: float = 0.0
+        self.last_similarity:  float = 1.0
+        self.last_anchor_sim:  float = 1.0
+        self.chunks_accepted:  int   = 0
+        self.chunks_rejected:  int   = 0
+        self._adapt_count:     int   = 0
 
         logger.info(
-            f"[Enrollment] v6 initialized — INSTANT (first-chunk) mode  "
+            f"[Enrollment] v7 initialized — FIRST-SENTENCE mode  "
             f"adaptive_threshold={similarity_threshold:.2f}  "
             f"anchor_threshold={self.anchor_threshold:.2f}  "
-            f"adapt_rate={adapt_rate}  "
+            f"min_enroll_chunks={min_enroll_chunks}  "
             f"extractor={'mfcc+delta+delta2' if self._use_mfcc else 'spectral'}"
         )
 
@@ -254,54 +268,129 @@ class SpeakerEnrollmentService:
 
     @property
     def enrollment_progress(self) -> float:
-        # v6: either not enrolled (0.0) or enrolled (1.0) — no partial progress
-        return 1.0 if self.is_enrolled else 0.0
+        if self.is_enrolled:
+            return 1.0
+        # Progress = max of chunk-based and seconds-based progress
+        if self.min_enroll_chunks == 0 or self.min_enroll_seconds == 0:
+            return 0.0
+        chunk_progress   = self._enroll_chunk_count / self.min_enroll_chunks
+        seconds_progress = self._enroll_audio_seconds / self.min_enroll_seconds
+        return min(max(chunk_progress, seconds_progress), 0.99)
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
-    def evaluate(self, audio_chunk: np.ndarray, is_voice: bool) -> "EnrollmentDecision":
+    def evaluate(
+        self,
+        audio_chunk: np.ndarray,
+        is_voice: bool,
+        silence_event: bool = False,
+        vad_prob: float = 0.0,
+    ) -> "EnrollmentDecision":
+        """
+        Evaluate one audio chunk.
+
+        Parameters
+        ──────────
+        audio_chunk    : raw mic audio (float32 or int16)
+        is_voice       : VAD decision for this chunk
+        silence_event  : True on the FIRST silent chunk after a voice segment
+                         (pass this from pipeline.py — it is the signal to lock
+                          the profile at the end of the first sentence)
+
+        Returns
+        ───────
+        EnrollmentDecision with send_to_asr, reason, similarity, enrolled, progress
+        """
         if len(audio_chunk) == 0:
             return EnrollmentDecision(send_to_asr=False, reason="empty_chunk")
 
         audio_chunk = audio_chunk.astype(np.float32)
 
-        # ── Phase 1: ENROLLING — instant lock on first valid voice chunk ─────
+        # ── Phase 1: COLLECTING — accumulate first sentence ──────────────────
         if not self.is_enrolled:
+            # Track consecutive voice for anti-spike gate
             if is_voice:
+                self._consec_voice_count += 1
+            else:
+                self._consec_voice_count = 0
+
+            # Accumulate only REAL voice chunks — not noise spikes
+            # A chunk must pass ALL four gates to count:
+            #   1. VAD says is_voice=True
+            #   2. VAD probability >= min_vad_prob (0.50) — not just marginal
+            #   3. RMS >= RMS_FLOOR (0.020) — real speech energy
+            #   4. At least min_consecutive_voice consecutive voice chunks — anti-spike
+            if is_voice and vad_prob >= self.min_vad_prob and self._consec_voice_count >= self.min_consecutive_voice:
                 rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
-
                 if rms >= RMS_FLOOR:
-                    # Lock immediately on this single chunk.
-                    # _extract_mfcc_full zero-pads to 200ms internally so even
-                    # a 20ms chunk produces a valid 39-dim embedding.
-                    embedding = _extract(audio_chunk, self.sample_rate, self._use_mfcc)
-                    self._lock_profile_instant(embedding, len(audio_chunk))
-
-                    logger.info(
-                        f"[Enrollment] ⚡ INSTANT LOCK — first voice chunk  "
-                        f"rms={rms:.4f}  samples={len(audio_chunk)}  "
-                        f"feat_dim={embedding.shape[0]}"
+                    chunk_seconds = len(audio_chunk) / self.sample_rate
+                    self._enroll_buffer.append(audio_chunk.copy())
+                    self._enroll_chunk_count  += 1
+                    self._enroll_audio_seconds += chunk_seconds
+                    logger.debug(
+                        f"[Enrollment] collecting chunk {self._enroll_chunk_count}  "
+                        f"rms={rms:.4f}  vad_prob={vad_prob:.2f}  "
+                        f"total={self._enroll_audio_seconds:.2f}s"
                     )
 
-                    # Forward this chunk to ASR immediately — no blocking.
-                    return EnrollmentDecision(
-                        send_to_asr = True,
-                        reason      = "enrolled_instant",
-                        similarity  = 1.0,
-                        enrolled    = True,
-                        progress    = 1.0,
+            # On silence — if not enough real speech yet, reset buffer to avoid
+            # enrolling on fragmented noise across multiple small gaps.
+            # Only lock if we have BOTH enough chunks AND enough seconds.
+            if silence_event:
+                has_enough = (
+                    self._enroll_chunk_count >= self.min_enroll_chunks
+                    and self._enroll_audio_seconds >= self.min_enroll_seconds
+                )
+                if not has_enough and self._enroll_chunk_count > 0:
+                    logger.debug(
+                        f"[Enrollment] silence_event — insufficient real speech "
+                        f"({self._enroll_chunk_count} chunks / {self._enroll_audio_seconds:.2f}s), "
+                        f"need {self.min_enroll_chunks} chunks / {self.min_enroll_seconds}s — resetting buffer"
                     )
+                    self._enroll_buffer.clear()
+                    self._enroll_chunk_count   = 0
+                    self._enroll_audio_seconds = 0.0
 
-            # Not yet a voice chunk (or rms too low) — waiting for first word
+            # Lock on silence_event IF we have enough chunks AND enough seconds
+            if silence_event and self._enroll_chunk_count >= self.min_enroll_chunks and self._enroll_audio_seconds >= self.min_enroll_seconds:
+                full_audio = np.concatenate(self._enroll_buffer)
+                embedding  = _extract(full_audio, self.sample_rate, self._use_mfcc)
+                self._lock_profile(embedding, len(full_audio))
+                self._enroll_buffer.clear()
+
+                logger.info(
+                    f"[Enrollment] ✅ FIRST-SENTENCE LOCK — "
+                    f"{self.enrolled_seconds*1000:.0f}ms of speech  "
+                    f"chunks={self._enroll_chunk_count}  "
+                    f"feat_dim={embedding.shape[0]}"
+                )
+
+                # Return enrolled=True, send_to_asr=False so pipeline replays
+                # pre-enroll buffer into ASR (existing pipeline.py logic handles this)
+                return EnrollmentDecision(
+                    send_to_asr = False,
+                    reason      = "enrolled_first_sentence",
+                    similarity  = 1.0,
+                    enrolled    = True,
+                    progress    = 1.0,
+                )
+
+            # Still collecting — silence event but not enough chunks yet
+            if silence_event and self._enroll_chunk_count > 0:
+                logger.debug(
+                    f"[Enrollment] silence_event but only {self._enroll_chunk_count} chunks "
+                    f"(need {self.min_enroll_chunks}) — waiting for more speech"
+                )
+
             return EnrollmentDecision(
                 send_to_asr = False,
-                reason      = "waiting_for_voice",
+                reason      = "collecting_first_sentence",
                 similarity  = None,
                 enrolled    = False,
-                progress    = 0.0,
+                progress    = self.enrollment_progress,
             )
 
-        # ── Phase 2: ENROLLED — two-layer similarity check ────────────────────
+        # ── Phase 2: ENROLLED — two-layer similarity check ───────────────────
         if not is_voice:
             return EnrollmentDecision(
                 send_to_asr = False,
@@ -312,7 +401,7 @@ class SpeakerEnrollmentService:
 
         embedding = _extract(audio_chunk, self.sample_rate, self._use_mfcc)
 
-        # ── Layer 1: Anchor check (hard floor) ────────────────────────────────
+        # Layer 1: Anchor check (hard floor — never moves)
         anchor_sim = _cosine_similarity(self._anchor_profile, embedding)
         self.last_anchor_sim = anchor_sim
 
@@ -325,12 +414,12 @@ class SpeakerEnrollmentService:
             return EnrollmentDecision(
                 send_to_asr = False,
                 reason      = "speaker_mismatch",
-                similarity  = anchor_sim,   # use anchor_sim so client never sees None
+                similarity  = anchor_sim,
                 enrolled    = True,
                 progress    = 1.0,
             )
 
-        # ── Layer 2: Adaptive check ───────────────────────────────────────────
+        # Layer 2: Adaptive check
         adaptive_sim = _cosine_similarity(self._adaptive_profile, embedding)
         self.last_similarity = adaptive_sim
 
@@ -349,7 +438,7 @@ class SpeakerEnrollmentService:
                 progress    = 1.0,
             )
 
-        # ── ACCEPTED — blend into adaptive profile ────────────────────────────
+        # ACCEPTED — blend into adaptive profile
         self.chunks_accepted += 1
 
         if self.chunks_accepted >= self.adapt_min_chunks:
@@ -371,12 +460,8 @@ class SpeakerEnrollmentService:
 
     # ── Private ───────────────────────────────────────────────────────────────
 
-    def _lock_profile_instant(self, embedding: np.ndarray, n_samples: int):
-        """
-        v6: Lock profile immediately from a single embedding.
-        The anchor is set to this normalised embedding.
-        The adaptive profile starts as a copy and drifts over time.
-        """
+    def _lock_profile(self, embedding: np.ndarray, n_samples: int):
+        """Lock the anchor and adaptive profiles from a full-sentence embedding."""
         if self._locked:
             return
 
@@ -392,7 +477,7 @@ class SpeakerEnrollmentService:
         self.enrolled_seconds  = n_samples / self.sample_rate
 
         logger.info(
-            f"[Enrollment] ✅ Profile LOCKED (instant) — "
+            f"[Enrollment] Profile LOCKED (first-sentence) — "
             f"{self.enrolled_seconds*1000:.0f}ms  "
             f"feat_dim={profile.shape[0]}  "
             f"extractor={'mfcc+delta+delta2' if self._use_mfcc else 'spectral'}  "
@@ -401,10 +486,7 @@ class SpeakerEnrollmentService:
         )
 
     def _adapt_profile(self, embedding: np.ndarray):
-        """
-        Exponential moving average blend into the adaptive profile.
-        The anchor is NEVER touched.
-        """
+        """EMA blend into the adaptive profile. Anchor is NEVER touched."""
         self._adaptive_profile = (
             (1.0 - self.adapt_rate) * self._adaptive_profile
             + self.adapt_rate * embedding
@@ -422,27 +504,33 @@ class SpeakerEnrollmentService:
         self._anchor_profile   = None
         self._adaptive_profile = None
         self._locked           = False
+        self._enroll_buffer.clear()
+        self._enroll_chunk_count   = 0
+        self._enroll_audio_seconds = 0.0
+        self._consec_voice_count   = 0
         self.enrolled_seconds  = 0.0
         self.last_similarity   = 1.0
         self.last_anchor_sim   = 1.0
         self.chunks_accepted   = 0
         self.chunks_rejected   = 0
         self._adapt_count      = 0
-        logger.info("[Enrollment] Reset — ready for next first-chunk enrollment")
+        logger.info("[Enrollment] Reset — ready for new first-sentence enrollment")
 
     def get_stats(self) -> dict:
         return {
-            "enrolled":           self.is_enrolled,
-            "enrolled_seconds":   round(self.enrolled_seconds, 2),
-            "progress":           round(self.enrollment_progress, 2),
-            "last_similarity":    round(self.last_similarity, 3),
-            "last_anchor_sim":    round(self.last_anchor_sim, 3),
-            "chunks_accepted":    self.chunks_accepted,
-            "chunks_rejected":    self.chunks_rejected,
-            "adapt_count":        self._adapt_count,
-            "adaptive_threshold": self.similarity_threshold,
-            "anchor_threshold":   round(self.anchor_threshold, 3),
-            "feat_dim":           (
+            "enrolled":             self.is_enrolled,
+            "enrolled_seconds":     round(self.enrolled_seconds, 2),
+            "progress":             round(self.enrollment_progress, 2),
+            "enroll_chunks_so_far": self._enroll_chunk_count,
+            "enroll_seconds_so_far": round(self._enroll_audio_seconds, 2),
+            "last_similarity":      round(self.last_similarity, 3),
+            "last_anchor_sim":      round(self.last_anchor_sim, 3),
+            "chunks_accepted":      self.chunks_accepted,
+            "chunks_rejected":      self.chunks_rejected,
+            "adapt_count":          self._adapt_count,
+            "adaptive_threshold":   self.similarity_threshold,
+            "anchor_threshold":     round(self.anchor_threshold, 3),
+            "feat_dim": (
                 39 if (self._use_mfcc and self._anchor_profile is not None
                        and len(self._anchor_profile) == 39)
                 else 13 if self._use_mfcc else 8

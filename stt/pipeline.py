@@ -180,7 +180,9 @@ class STTPipeline:
             if is_voice and not self._was_enrolled:
                 self._pre_enroll_buffer.append(audio.copy())
 
-            decision = self.enrollment.evaluate(audio, is_voice=is_voice)
+            decision = self.enrollment.evaluate(
+                audio, is_voice=is_voice, silence_event=silence_event, vad_prob=prob
+            )
             events.append({"type": "enrollment", **decision.to_dict()})
 
             # ── Detect the lock transition ────────────────────────────────

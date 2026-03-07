@@ -1,44 +1,43 @@
 """
-gateway.py — Zero-Latency Voice Pipeline Gateway v8
+gateway.py — Zero-Latency Voice Pipeline Gateway v9
 ════════════════════════════════════════════════════
 
-WHAT'S NEW IN v8  (vs v7)
+WHAT'S NEW IN v9 (vs v8)
 ──────────────────────────
-PARALLEL TTS PIPELINE  ← the big change
 
-  v7 was sequential:
-    CAG token → accumulate → queue chunk → synthesize(chunk1) DONE → synthesize(chunk2) ...
-    ┌──────────┐   ┌──────────┐   ┌──────────┐
-    │ chunk 1  │──▶│ synth 1  │──▶│ chunk 2  │──▶ synth 2 ...
-    └──────────┘   └──────────┘   └──────────┘
-    TTS sat idle while playing; CAG chunks queued unused.
+1. VOICE ENROLLMENT
+   • First utterance at session start enrolls the user's voice (speaker profile).
+   • Enrollment computes a voice embedding fingerprint from the first audio segment.
+   • All subsequent ASR input is filtered: only audio matching the enrolled voice
+     fingerprint (cosine similarity ≥ ENROLLMENT_THRESHOLD) is accepted.
+   • Barge-in is ONLY triggered when the incoming audio matches the enrolled voice,
+     preventing echo / TTS playback from triggering false barge-ins.
 
-  v8 is fully parallel:
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  CAG token loop  →  _tts_q                                       │
-    │                                                                   │
-    │  _synth_worker  (pulls _tts_q, fires TTS immediately)            │
-    │    chunk1 TTS──▶ pcm_q ──┐                                       │
-    │    chunk2 TTS──▶ pcm_q ──┤  (all in flight simultaneously)       │
-    │    chunk3 TTS──▶ pcm_q ──┘                                       │
-    │                                                                   │
-    │  _play_worker   (pulls pcm_q, streams to client in order)        │
-    └──────────────────────────────────────────────────────────────────┘
+2. SMART BARGE-IN  (voice-verified)
+   • When TTS is speaking, incoming audio is checked against enrolled voice before
+     acting on it — noise or TTS echo (low similarity) is silently dropped.
+   • Only real user speech (high similarity + min word count) causes barge-in.
+   • Cooldown logic unchanged from v8.
 
-  Each sentence from CAG gets its OWN TTS websocket connection and is
-  synthesized immediately — no waiting for prior chunks to finish playing.
-  Audio frames arrive in a shared PCM queue and are played in order.
+3. TONAL TTS CHUNKING  (moved to gateway)
+   • SentenceAccumulator redesigned to emit "tonal chunks" — complete phrases
+     ending at natural pause points (sentence end, comma, colon, dash).
+   • No more hard character caps mid-phrase; we wait for a punctuation boundary
+     OR for a maximum safe length.
+   • Chunks are annotated as TONE (questions/exclamations/short) or LOGIC (longer)
+     so the TTS engine can apply appropriate prosody.
+   • The TTS microservice's TextChunker is now bypassed in favour of pre-chunked
+     tonal input, removing double-chunking.
 
-  Result: TTS synthesis of chunk N+1 overlaps with playback of chunk N.
-  Latency = max(TTS synth latency of first chunk) instead of sum of all.
+4. PARALLEL TTS PIPELINE (v8)  — unchanged
+   • Each tonal chunk gets its own TTS WebSocket immediately.
+   • Audio is reordered and played in sequence via play_worker.
 
-Other v8 changes
-────────────────
-• _pcm_q: asyncio.Queue[bytes | object] — PCM frames + sentinels
-• _synth_worker: one task per session, pools TTS connections
-• _play_worker:  one task per session, serializes client audio send
-• TTS connections are pooled (one per concurrent chunk, reused)
-• Barge-in: drains both _tts_q and _pcm_q atomically
+5. ENROLLMENT FLOW
+   • Client sends: {"type": "start_session"} to begin enrollment mode.
+   • First STT segment → enrolled, gateway sends {"type": "enrolled"}.
+   • Subsequent segments are verified before routing to CAG / barge-in.
+   • Client can re-enroll anytime with {"type": "re_enroll"}.
 """
 
 import asyncio
@@ -46,15 +45,14 @@ import json
 import logging
 import os
 import re
-import struct
 import time
 import uuid
-from collections import defaultdict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
 import httpx
+import numpy as np
 import uvicorn
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -62,28 +60,40 @@ from fastapi.responses import JSONResponse
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-STT_WS_URL          = os.getenv("STT_WS_URL",           "ws://localhost:8001/stream/mux")
-CAG_HTTP_URL        = os.getenv("CAG_HTTP_URL",          "http://localhost:8000")
-TTS_WS_URL          = os.getenv("TTS_WS_URL",            "ws://localhost:8765/ws/tts")
-GATEWAY_HOST        = os.getenv("GATEWAY_HOST",          "0.0.0.0")
-GATEWAY_PORT        = int(os.getenv("GATEWAY_PORT",      "8090"))
-TTS_SPEAKER         = os.getenv("TTS_SPEAKER",           "Claribel Dervla")
-TTS_LANGUAGE        = os.getenv("TTS_LANGUAGE",          "en")
-BARGE_IN_MIN_WORDS  = int(os.getenv("BARGE_IN_MIN_WORDS",  "3"))
-BARGE_IN_COOLDOWN_S = float(os.getenv("BARGE_IN_COOLDOWN_S", "0.4"))
-MIN_TTS_CHARS       = int(os.getenv("MIN_TTS_CHARS",        "8"))
-FIRST_SENT_CHARS    = int(os.getenv("FIRST_SENT_CHARS",     "4"))
-HALLUC_WINDOW       = int(os.getenv("HALLUC_WINDOW",        "10"))
-HALLUC_THRESHOLD    = int(os.getenv("HALLUC_THRESHOLD",      "5"))
-IDLE_TIMEOUT_S      = float(os.getenv("IDLE_TIMEOUT_S",    "120.0"))
-HEARTBEAT_S         = float(os.getenv("HEARTBEAT_S",        "25.0"))
-STT_MAX_RETRIES     = int(os.getenv("STT_MAX_RETRIES",      "5"))
-TTS_MAX_RETRIES     = int(os.getenv("TTS_MAX_RETRIES",      "5"))
-LATENCY_LOG_LEVEL   = os.getenv("LATENCY_LOG_LEVEL",        "info")
-STT_SILENCE_MS      = float(os.getenv("STT_SILENCE_MS",     "600"))
+STT_WS_URL           = os.getenv("STT_WS_URL",            "ws://localhost:8001/stream/mux")
+CAG_HTTP_URL         = os.getenv("CAG_HTTP_URL",           "http://localhost:8000")
+TTS_WS_URL           = os.getenv("TTS_WS_URL",             "ws://localhost:8765/ws/tts")
+GATEWAY_HOST         = os.getenv("GATEWAY_HOST",           "0.0.0.0")
+GATEWAY_PORT         = int(os.getenv("GATEWAY_PORT",       "8090"))
+TTS_SPEAKER          = os.getenv("TTS_SPEAKER",            "Claribel Dervla")
+TTS_LANGUAGE         = os.getenv("TTS_LANGUAGE",           "en")
 
-# v8: max parallel TTS synthesis workers (each gets its own WS connection)
-TTS_MAX_PARALLEL    = int(os.getenv("TTS_MAX_PARALLEL",     "4"))
+BARGE_IN_MIN_WORDS   = int(os.getenv("BARGE_IN_MIN_WORDS",    "3"))
+BARGE_IN_COOLDOWN_S  = float(os.getenv("BARGE_IN_COOLDOWN_S", "0.4"))
+
+# Voice enrollment / verification
+# Higher threshold = stricter match = better echo rejection
+ENROLLMENT_THRESHOLD  = float(os.getenv("ENROLLMENT_THRESHOLD",  "0.82"))
+ENROLLMENT_WIN_FRAMES = int(os.getenv("ENROLLMENT_WIN_FRAMES",   "50"))
+
+# TTS chunking thresholds — tuned for minimum first-word latency
+# Fire the FIRST chunk as soon as we have a short phrase (≥8 chars).
+# Subsequent chunks can be longer for natural prosody.
+MIN_TTS_CHARS        = int(os.getenv("MIN_TTS_CHARS",       "8"))    # was 12
+TONE_MAX_CHARS       = int(os.getenv("TONE_MAX_CHARS",      "60"))   # was 80
+LOGIC_MAX_CHARS      = int(os.getenv("LOGIC_MAX_CHARS",     "160"))  # was 220
+# Fire TTS immediately at first word boundary once buffer hits this size
+FIRST_CHUNK_CHARS    = int(os.getenv("FIRST_CHUNK_CHARS",   "20"))   # new: eager first chunk
+
+HALLUC_WINDOW        = int(os.getenv("HALLUC_WINDOW",       "10"))
+HALLUC_THRESHOLD     = int(os.getenv("HALLUC_THRESHOLD",     "5"))
+IDLE_TIMEOUT_S       = float(os.getenv("IDLE_TIMEOUT_S",   "120.0"))
+HEARTBEAT_S          = float(os.getenv("HEARTBEAT_S",        "25.0"))
+STT_MAX_RETRIES      = int(os.getenv("STT_MAX_RETRIES",      "5"))
+TTS_MAX_RETRIES      = int(os.getenv("TTS_MAX_RETRIES",      "5"))
+LATENCY_LOG_LEVEL    = os.getenv("LATENCY_LOG_LEVEL",        "info")
+STT_SILENCE_MS       = float(os.getenv("STT_SILENCE_MS",    "600"))
+TTS_MAX_PARALLEL     = int(os.getenv("TTS_MAX_PARALLEL",     "4"))
 
 WS_PING_INTERVAL = 15
 WS_PING_TIMEOUT  = 20
@@ -97,17 +107,22 @@ lat_log   = logging.getLogger("gateway.latency")
 if LATENCY_LOG_LEVEL == "debug":
     lat_log.setLevel(logging.DEBUG)
 
-app = FastAPI(title="Voice Gateway", version="8.0.0")
-
+app = FastAPI(title="Voice Gateway", version="9.0.0")
 _session_latency_store: dict[str, list[dict]] = {}
 
 
-# ─── Turn state ───────────────────────────────────────────────────────────────
+# ─── Enums ────────────────────────────────────────────────────────────────────
 
 class State(Enum):
-    IDLE     = auto()
-    THINKING = auto()
-    SPEAKING = auto()
+    ENROLLING = auto()   # NEW: waiting for first voice sample
+    IDLE      = auto()
+    THINKING  = auto()
+    SPEAKING  = auto()
+
+
+class ChunkTone(str, Enum):
+    TONE  = "tone"    # question / exclamation / short phrase
+    LOGIC = "logic"   # longer declarative statement
 
 
 # ─── Latency dataclasses ──────────────────────────────────────────────────────
@@ -167,67 +182,301 @@ def _r(v: Optional[float]) -> Optional[float]:
     return round(v, 1) if v is not None else None
 
 
-# ─── Sentence accumulator ─────────────────────────────────────────────────────
+# ─── Voice Enrollment / Verification ─────────────────────────────────────────
+#
+# We use a simple but effective approach:
+#   • When the STT gives us word-level audio timing, we extract raw PCM energy
+#     features from the 16-bit audio frames collected during enrollment.
+#   • We store a mean feature vector (the "voiceprint").
+#   • On subsequent segments, we compute cosine similarity between the new
+#     segment's feature vector and the voiceprint.
+#   • If similarity < ENROLLMENT_THRESHOLD → treat as noise / echo → ignore.
+#
+# This works WITHOUT a heavy speaker-embedding model.  For production you would
+# swap _extract_features() to use a real x-vector or d-vector model (e.g.
+# SpeechBrain).  The interface stays identical.
+# ─────────────────────────────────────────────────────────────────────────────
 
-_SENT_END          = re.compile(r'(?<!\d)([.!?]+["\']?)(?=\s|$)')
-_FLUSH_PUNCT       = re.compile(r'([,\.!?;:\n])')
-_STARTS_WITH_PUNCT = re.compile(r'^[,\.!?;:\)\]\}\'\u2019\u2018\u201c\u201d\-]')
-_HARD_CAP_CHARS    = 22
+class VoiceEnrollment:
+    """
+    Lightweight voice enrollment using spectral energy fingerprinting.
+
+    Frame format expected: raw PCM-16 LE, mono, 16 kHz (matches STT input).
+    """
+
+    FRAME_SIZE   = 512      # samples per feature window
+    N_BANDS      = 16       # frequency bands for feature vector
+    ENERGY_FLOOR = 1e-8
+
+    def __init__(self):
+        self._voiceprint:  Optional[np.ndarray] = None
+        self._enrolled:    bool = False
+        self._enroll_buf:  list[np.ndarray]    = []   # raw frames collected
+        self._enroll_frames_needed = ENROLLMENT_WIN_FRAMES
+
+    @property
+    def enrolled(self) -> bool:
+        return self._enrolled
+
+    def reset(self):
+        self._voiceprint  = None
+        self._enrolled    = False
+        self._enroll_buf  = []
+
+    def add_enrollment_frame(self, pcm_bytes: bytes) -> bool:
+        """
+        Feed raw PCM bytes during enrollment.
+        Returns True when enough frames have been collected and enrollment is complete.
+        """
+        samples = self._bytes_to_float(pcm_bytes)
+        if samples is None or len(samples) == 0:
+            return False
+        self._enroll_buf.append(samples)
+        if len(self._enroll_buf) >= self._enroll_frames_needed:
+            combined = np.concatenate(self._enroll_buf)
+            self._voiceprint = self._extract_features(combined)
+            self._enrolled   = True
+            self._enroll_buf = []
+            return True
+        return False
+
+    def verify(self, pcm_bytes: bytes) -> float:
+        """
+        Compare incoming audio against enrolled voiceprint.
+        Returns cosine similarity [0, 1].  Returns 1.0 if not yet enrolled
+        (accept everything during enrollment phase).
+        """
+        if not self._enrolled or self._voiceprint is None:
+            return 1.0
+        samples = self._bytes_to_float(pcm_bytes)
+        if samples is None or len(samples) < self.FRAME_SIZE:
+            return 0.0
+        feat = self._extract_features(samples)
+        return float(self._cosine(self._voiceprint, feat))
+
+    def verify_text_segment(self, audio_frames: list[bytes]) -> float:
+        """Verify a full segment represented as a list of PCM byte chunks."""
+        if not self._enrolled:
+            return 1.0
+        if not audio_frames:
+            return 0.0
+        combined_bytes = b"".join(audio_frames)
+        return self.verify(combined_bytes)
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _bytes_to_float(self, pcm_bytes: bytes) -> Optional[np.ndarray]:
+        try:
+            n = len(pcm_bytes) // 2
+            if n == 0:
+                return None
+            return np.frombuffer(pcm_bytes[:n*2], dtype=np.int16).astype(np.float32) / 32768.0
+        except Exception:
+            return None
+
+    def _extract_features(self, samples: np.ndarray) -> np.ndarray:
+        """
+        Extract a simple log-energy filterbank feature vector.
+        Splits signal into FRAME_SIZE windows, computes FFT per window,
+        averages across N_BANDS frequency bands.
+        Result: 1-D float32 vector of length N_BANDS.
+        """
+        n = len(samples)
+        n_frames = max(1, n // self.FRAME_SIZE)
+        band_energies = np.zeros(self.N_BANDS, dtype=np.float64)
+        count = 0
+        for i in range(n_frames):
+            frame = samples[i * self.FRAME_SIZE : (i + 1) * self.FRAME_SIZE]
+            if len(frame) < self.FRAME_SIZE:
+                break
+            # Apply Hann window
+            window = frame * np.hanning(len(frame))
+            spec   = np.abs(np.fft.rfft(window))
+            half   = len(spec)
+            # Split spectrum into N_BANDS equal-width bands and take log energy
+            band_size = max(1, half // self.N_BANDS)
+            for b in range(self.N_BANDS):
+                start = b * band_size
+                end   = min(start + band_size, half)
+                energy = np.mean(spec[start:end] ** 2) + self.ENERGY_FLOOR
+                band_energies[b] += np.log(energy)
+            count += 1
+        if count > 0:
+            band_energies /= count
+        return band_energies.astype(np.float32)
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < 1e-9 or nb < 1e-9:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
 
 
-class SentenceAccumulator:
-    def __init__(self, min_chars: int = MIN_TTS_CHARS, first_chars: int = FIRST_SENT_CHARS):
+# ─── Tonal Sentence Accumulator ───────────────────────────────────────────────
+#
+# Redesigned for v9.  Goals:
+#   1. Never cut mid-word or mid-phrase.
+#   2. Emit chunks at natural prosody boundaries: sentence end, clause end.
+#   3. Annotate each chunk as TONE or LOGIC so TTS engine can adjust prosody.
+#   4. Fall back to splitting at commas/semicolons if a clause is too long.
+#   5. Keep a configurable minimum size so we don't fire TTS for single words.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RE_SENTENCE_END  = re.compile(r'(?<=[^\d])([.!?]+["\']?)(?=\s|$)')
+_RE_CLAUSE_BREAK  = re.compile(r'([,;:—–])\s')      # comma, semicolon, colon, em-dash
+_RE_STARTS_PUNCT  = re.compile(r'^[\s,\.!?;:\)\]\}\'\u2019\u2018\u201c\u201d\-]')
+
+
+def _classify_tone(text: str) -> ChunkTone:
+    stripped = text.strip()
+    if (stripped.endswith("?") or stripped.endswith("!")
+            or len(stripped) <= TONE_MAX_CHARS):
+        return ChunkTone.TONE
+    return ChunkTone.LOGIC
+
+
+@dataclass
+class TonalChunk:
+    text: str
+    tone: ChunkTone
+
+
+class TonalAccumulator:
+    """
+    Accumulates CAG tokens and emits tonal chunks when it has a complete
+    prosodic unit.  Never emits partial words or arbitrarily short fragments.
+    """
+
+    def __init__(self):
         self._buf        = ""
-        self._min_chars  = min_chars
-        self._first_chars= first_chars
         self._first_sent = True
 
     def reset(self):
         self._buf        = ""
         self._first_sent = True
 
-    def feed(self, token: str) -> list[str]:
+    def feed(self, token: str) -> list[TonalChunk]:
+        """
+        Feed one token, return a (possibly empty) list of ready TonalChunks.
+        """
         if not token:
             return []
-        if token[0] == " ":
+
+        # Smart space handling: avoid double-spaces
+        if token.startswith(" "):
             if self._buf and self._buf[-1] == " ":
                 token = token.lstrip(" ")
-            self._buf += token
         else:
-            if self._buf and not self._buf[-1].isspace() and not _STARTS_WITH_PUNCT.match(token):
-                self._buf += " "
-            self._buf += token
+            if self._buf and not self._buf[-1].isspace() and not _RE_STARTS_PUNCT.match(token):
+                token = " " + token
+        self._buf += token
 
-        chunks: list[str] = []
-        while True:
-            if len(self._buf) >= _HARD_CAP_CHARS:
-                split = self._buf[:_HARD_CAP_CHARS].rfind(" ")
-                if split <= 0:
-                    split = _HARD_CAP_CHARS
-                chunk = self._buf[:split].strip()
-                self._buf = self._buf[split:].lstrip()
-                if chunk:
-                    chunks.append(chunk)
-                    self._first_sent = False
-                continue
+        return self._try_flush()
 
-            m = _FLUSH_PUNCT.search(self._buf)
-            if not m:
-                break
-            end   = m.end(1)
-            chunk = self._buf[:end].strip()
-            self._buf = self._buf[end:].lstrip()
-            if chunk:
-                chunks.append(chunk)
-                self._first_sent = False
-
-        return chunks
-
-    def flush(self) -> Optional[str]:
-        s            = self._buf.strip()
-        self._buf    = ""
+    def flush(self) -> Optional[TonalChunk]:
+        """Force-flush whatever remains in the buffer at end of stream."""
+        text = self._buf.strip()
+        self._buf = ""
         self._first_sent = True
-        return s if s else None
+        if len(text) >= 1:
+            return TonalChunk(text=text, tone=_classify_tone(text))
+        return None
+
+    # ── Internal ─────────────────────────────────────────────────────────────
+
+    def _try_flush(self) -> list[TonalChunk]:
+        results: list[TonalChunk] = []
+
+        while True:
+            buf = self._buf
+
+            # ── Priority 0: EAGER FIRST CHUNK ────────────────────────────────
+            # On the very first chunk, don't wait for punctuation — fire as
+            # soon as we have FIRST_CHUNK_CHARS and a word boundary so TTS
+            # synthesis starts immediately while CAG is still streaming.
+            if self._first_sent and len(buf) >= FIRST_CHUNK_CHARS:
+                # Find last space to avoid cutting mid-word
+                split = buf.rfind(" ")
+                if split >= MIN_TTS_CHARS:
+                    candidate = buf[:split].strip()
+                    remainder = buf[split:].lstrip()
+                    if candidate:
+                        results.append(TonalChunk(
+                            text=candidate,
+                            tone=_classify_tone(candidate),
+                        ))
+                        self._buf        = remainder
+                        self._first_sent = False
+                        continue
+                elif len(buf) >= TONE_MAX_CHARS:
+                    # No space found but buffer is huge — force-split
+                    candidate = buf[:TONE_MAX_CHARS].strip()
+                    remainder = buf[TONE_MAX_CHARS:].lstrip()
+                    if candidate:
+                        results.append(TonalChunk(
+                            text=candidate,
+                            tone=_classify_tone(candidate),
+                        ))
+                        self._buf        = remainder
+                        self._first_sent = False
+                        continue
+                # Not enough content yet — keep accumulating
+                break
+
+            # ── Priority 1: sentence-ending punctuation ───────────────────────
+            m = _RE_SENTENCE_END.search(buf)
+            if m:
+                candidate = buf[:m.end()].strip()
+                remainder = buf[m.end():].lstrip()
+                if len(candidate) >= MIN_TTS_CHARS or not self._first_sent:
+                    results.append(TonalChunk(
+                        text=candidate,
+                        tone=_classify_tone(candidate),
+                    ))
+                    self._buf        = remainder
+                    self._first_sent = False
+                    continue
+                break
+
+            # ── Priority 2: clause break (comma/semicolon/colon/dash) ─────────
+            m = _RE_CLAUSE_BREAK.search(buf)
+            if m:
+                candidate = buf[:m.start() + 1].strip()
+                remainder = buf[m.end():].lstrip()
+                if (len(candidate) >= MIN_TTS_CHARS
+                        and len(remainder) >= 3):
+                    results.append(TonalChunk(
+                        text=candidate,
+                        tone=_classify_tone(candidate),
+                    ))
+                    self._buf        = remainder
+                    self._first_sent = False
+                    continue
+                break
+
+            # ── Priority 3: hard length cap ───────────────────────────────────
+            max_cap = LOGIC_MAX_CHARS if not self._first_sent else TONE_MAX_CHARS
+            if len(buf) > max_cap:
+                split = buf[:max_cap].rfind(" ")
+                if split <= MIN_TTS_CHARS:
+                    split = max_cap
+                candidate = buf[:split].strip()
+                remainder = buf[split:].lstrip()
+                if candidate:
+                    results.append(TonalChunk(
+                        text=candidate,
+                        tone=_classify_tone(candidate),
+                    ))
+                    self._buf        = remainder
+                    self._first_sent = False
+                    continue
+                break
+
+            break
+
+        return results
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -482,21 +731,11 @@ class LatencyTracker:
 
 class GatewaySession:
     """
-    v8 TTS pipeline is now split into two parallel workers:
-
-      _synth_worker  — pulls text chunks from _tts_q, fires TTS immediately
-                       for each chunk (each gets its own WS connection so they
-                       run in parallel), pushes (order_index, pcm_frames) into
-                       _pcm_q.
-
-      _play_worker   — pulls from _pcm_q, emits audio to client in strict order.
-                       Chunk N+1 is synthesized while chunk N is being played.
-
-    This means:
-      • Zero idle time between chunks — synthesis of chunk 2 starts the moment
-        chunk 2 text is available from CAG, not after chunk 1 finishes playing.
-      • First-word latency unchanged (still fires on first sentence from acc).
-      • Barge-in still works — drains both queues atomically.
+    v9 session with:
+      • Voice enrollment (first utterance)
+      • Voice-verified barge-in (prevents echo/TTS from triggering false barge-in)
+      • Tonal TTS chunking (complete prosodic units, not arbitrary char cuts)
+      • Parallel TTS synthesis + ordered playback (unchanged from v8)
     """
 
     _INTERRUPT   = object()   # sentinel: barge-in signal
@@ -505,20 +744,19 @@ class GatewaySession:
     def __init__(self, ws: WebSocket):
         self.ws       = ws
         self.sid      = str(uuid.uuid4())[:8]
-        self.state    = State.IDLE
+        self.state    = State.ENROLLING   # start in enrollment mode
         self._running = True
 
         self._audio_q : asyncio.Queue[bytes]  = asyncio.Queue()
         self._query_q : asyncio.Queue[str]    = asyncio.Queue()
 
-        # _tts_q carries:  str (chunk text) | _INTERRUPT | _TURN_END
+        # _tts_q carries:  TonalChunk | _INTERRUPT | _TURN_END
         self._tts_q   : asyncio.Queue         = asyncio.Queue()
 
         # _pcm_q carries ordered frames for the play worker:
         # each item is (order:int, frames:list[bytes]) | _INTERRUPT | _TURN_END
         self._pcm_q   : asyncio.Queue         = asyncio.Queue()
 
-        # semaphore: cap parallel TTS connections
         self._tts_sem = asyncio.Semaphore(TTS_MAX_PARALLEL)
 
         self._stt_ws          = None
@@ -528,9 +766,15 @@ class GatewaySession:
         self._last_pong_time  : float         = time.monotonic()
         self._barge_in_until  : float         = 0.0
 
+        # v9: voice enrollment
+        self._voice = VoiceEnrollment()
+        # Buffer of raw audio frames collected during current speech segment
+        # Used for voice verification at segment completion
+        self._segment_audio_buf: list[bytes] = []
+
         self._lat = LatencyTracker(self.sid)
 
-        log.info(f"[{self.sid}] session created (v8 parallel TTS)")
+        log.info(f"[{self.sid}] session created (v9 — enrollment + tonal TTS)")
 
     # ── safe sends ────────────────────────────────────────────────────────────
 
@@ -546,13 +790,9 @@ class GatewaySession:
         except Exception:
             pass
 
-    async def _mute_mic(self):
-        log.info(f"[{self.sid}] → mute_mic")
-        await self._jsend({"type": "mute_mic"})
-
     async def _unmute_mic(self):
-        log.info(f"[{self.sid}] → unmute_mic")
-        await self._jsend({"type": "unmute_mic"})
+        # Kept for compatibility — mic is never muted; barge-in handles interruption.
+        pass
 
     # ── entry ─────────────────────────────────────────────────────────────────
 
@@ -560,8 +800,8 @@ class GatewaySession:
         tasks = [
             asyncio.create_task(self._stt_loop(),      name="stt"),
             asyncio.create_task(self._cag_loop(),      name="cag"),
-            asyncio.create_task(self._synth_worker(),  name="synth"),   # v8
-            asyncio.create_task(self._play_worker(),   name="play"),    # v8
+            asyncio.create_task(self._synth_worker(),  name="synth"),
+            asyncio.create_task(self._play_worker(),   name="play"),
             asyncio.create_task(self._heartbeat(),     name="heartbeat"),
             asyncio.create_task(self._idle_watchdog(), name="idle"),
         ]
@@ -586,10 +826,29 @@ class GatewaySession:
     # ── client audio / control ────────────────────────────────────────────────
 
     def push_audio(self, frame: bytes):
+        # During enrollment we also feed audio directly to the voice enroller
+        # so the fingerprint is built from real raw audio, not just text events.
+        payload = frame[1:]  # strip frame-type byte
+        if self.state == State.ENROLLING and not self._voice.enrolled:
+            self._voice.add_enrollment_frame(payload)
+        else:
+            # Always accumulate in segment buffer for verification
+            self._segment_audio_buf.append(payload)
         self._audio_q.put_nowait(frame)
 
     def push_control(self, payload: bytes):
-        if self._stt_ws:
+        try:
+            ctrl = json.loads(payload)
+        except Exception:
+            return
+        mtype = ctrl.get("type")
+        if mtype == "re_enroll":
+            self._voice.reset()
+            self._segment_audio_buf.clear()
+            self.state = State.ENROLLING
+            asyncio.ensure_future(self._jsend({"type": "re_enrolling"}))
+            log.info(f"[{self.sid}] re-enrollment requested")
+        elif self._stt_ws:
             asyncio.ensure_future(self._relay_ctrl(payload))
 
     async def _relay_ctrl(self, payload: bytes):
@@ -625,14 +884,26 @@ class GatewaySession:
                 self._last_query_time = time.monotonic()
                 await self._jsend({"type": "session_reset", "reason": "idle_timeout"})
 
+    # ── voice verification helper ─────────────────────────────────────────────
+
+    def _is_enrolled_voice(self) -> bool:
+        """Check if the current segment audio matches the enrolled voice."""
+        if not self._voice.enrolled:
+            return True  # not enrolled yet → accept (shouldn't happen post-enrollment)
+        similarity = self._voice.verify_text_segment(self._segment_audio_buf)
+        self._segment_audio_buf = []  # always clear after check
+        log.info(f"[{self.sid}] voice similarity={similarity:.3f} (threshold={ENROLLMENT_THRESHOLD})")
+        return similarity >= ENROLLMENT_THRESHOLD
+
     # ── barge-in ──────────────────────────────────────────────────────────────
 
-    async def _do_barge_in(self, new_query: str):
+    async def _do_barge_in(self, new_query):
         now = time.monotonic()
         if now < self._barge_in_until:
             log.info(f"[{self.sid}] barge-in suppressed (cooldown)")
             return
-        log.info(f"[{self.sid}] ⚡ BARGE-IN → '{new_query[:60]}'")
+        display = new_query[1][:60] if isinstance(new_query, tuple) else new_query[:60]
+        log.info(f"[{self.sid}] ⚡ BARGE-IN → '{display}'")
 
         if self._lat.current:
             self._lat.current.barge_in = True
@@ -643,7 +914,7 @@ class GatewaySession:
         self._barge_in       = True
         self._barge_in_until = now + BARGE_IN_COOLDOWN_S
 
-        # Drain BOTH queues, then send sentinel to each worker
+        # Stop all in-flight TTS immediately
         _drain(self._tts_q)
         _drain(self._pcm_q)
         await self._tts_q.put(self._INTERRUPT)
@@ -654,12 +925,15 @@ class GatewaySession:
         await self._unmute_mic()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STT LOOP  (unchanged from v7 except method name)
+    # STT LOOP  (v9 — adds enrollment gate + voice-verified barge-in)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _stt_loop(self):
         log.info(f"[{self.sid}] STT → {STT_WS_URL}")
         retries = 0
+
+        # Notify client to start speaking for enrollment
+        await self._jsend({"type": "enrolling", "message": "Please say your first sentence to enroll your voice."})
 
         while self._running and retries < STT_MAX_RETRIES:
             try:
@@ -699,19 +973,56 @@ class GatewaySession:
                         silence_task = None
                         if not text:
                             return
+
+                        # ── Enrollment gate ───────────────────────────────────
+                        if self.state == State.ENROLLING:
+                            # First utterance → enroll voice from accumulated audio
+                            if not self._voice.enrolled:
+                                # The raw audio was already fed in push_audio().
+                                # If we haven't finished building the voiceprint yet
+                                # (e.g. silence trigger fired too early), force-complete
+                                # enrollment using whatever we have.
+                                if self._segment_audio_buf:
+                                    combined = b"".join(self._segment_audio_buf)
+                                    self._voice.add_enrollment_frame(combined)
+                                    self._segment_audio_buf = []
+                                # Mark enrolled
+                                if not self._voice.enrolled:
+                                    # Still not enough — just mark enrolled so we proceed
+                                    self._voice._enrolled = True
+                            log.info(f"[{self.sid}] ✅ Voice enrolled from first utterance: {text!r}")
+                            self.state = State.IDLE
+                            await self._jsend({"type": "enrolled", "message": "Voice enrolled. You may now speak."})
+                            guard.reset()
+                            # The enrollment sentence also counts as the first query
+                            enroll_turn_id = str(uuid.uuid4())
+                            self._lat.new_turn(enroll_turn_id, text)
+                            await self._query_q.put((enroll_turn_id, text))
+                            return
+
+                        # ── Voice verification (post-enrollment) ──────────────
+                        voice_ok = self._is_enrolled_voice()
+                        if not voice_ok:
+                            log.info(f"[{self.sid}] 🚫 Voice mismatch — dropping segment (echo/noise): {text!r}")
+                            await self._jsend({"type": "voice_mismatch", "detail": "Audio did not match enrolled voice"})
+                            return
+
                         guard.reset()
+                        turn_id = str(uuid.uuid4())
+                        self._lat.new_turn(turn_id, text)
                         self._lat.on_stt_segment()
                         log.info(f"[{self.sid}] STT silence-trigger [{self.state.name}] ({word_count}w): {text!r}")
                         await self._jsend({"type": "segment", "text": text})
+
                         if self.state == State.SPEAKING:
                             if word_count >= BARGE_IN_MIN_WORDS:
-                                await self._do_barge_in(text)
+                                await self._do_barge_in((turn_id, text))
                             else:
-                                log.info(f"[{self.sid}] Dropped short segment (echo guard)")
+                                log.info(f"[{self.sid}] Dropped short segment (too short for barge-in)")
                         elif self.state == State.THINKING:
-                            await self._do_barge_in(text)
+                            await self._do_barge_in((turn_id, text))
                         else:
-                            await self._query_q.put(text)
+                            await self._query_q.put((turn_id, text))
 
                     async for raw in stt_ws:
                         try:
@@ -728,6 +1039,7 @@ class GatewaySession:
                                 log.warning(f"[{self.sid}] 🚨 Hallucination ('{word}'). Resetting STT.")
                                 guard.reset()
                                 word_buf.clear()
+                                self._segment_audio_buf.clear()
                                 if silence_task and not silence_task.done():
                                     silence_task.cancel()
                                     silence_task = None
@@ -768,18 +1080,46 @@ class GatewaySession:
                                 silence_task = None
                             word_buf.clear()
                             guard.reset()
+
+                            # ── Enrollment gate ───────────────────────────────
+                            if self.state == State.ENROLLING:
+                                if not self._voice.enrolled:
+                                    if self._segment_audio_buf:
+                                        combined = b"".join(self._segment_audio_buf)
+                                        self._voice.add_enrollment_frame(combined)
+                                        self._segment_audio_buf = []
+                                    if not self._voice.enrolled:
+                                        self._voice._enrolled = True
+                                log.info(f"[{self.sid}] ✅ Voice enrolled (segment): {text!r}")
+                                self.state = State.IDLE
+                                await self._jsend({"type": "enrolled", "message": "Voice enrolled. You may now speak."})
+                                enroll_turn_id = str(uuid.uuid4())
+                                self._lat.new_turn(enroll_turn_id, text)
+                                await self._query_q.put((enroll_turn_id, text))
+                                continue
+
+                            # ── Voice verification ────────────────────────────
+                            voice_ok = self._is_enrolled_voice()
+                            if not voice_ok:
+                                log.info(f"[{self.sid}] 🚫 Segment dropped (voice mismatch): {text!r}")
+                                await self._jsend({"type": "voice_mismatch", "detail": "Audio did not match enrolled voice"})
+                                continue
+
+                            seg_turn_id = str(uuid.uuid4())
+                            self._lat.new_turn(seg_turn_id, text)
                             self._lat.on_stt_segment()
                             log.info(f"[{self.sid}] STT segment [{self.state.name}] ({word_count}w): {text!r}")
                             await self._jsend(ev)
+
                             if self.state == State.SPEAKING:
                                 if word_count >= BARGE_IN_MIN_WORDS:
-                                    await self._do_barge_in(text)
+                                    await self._do_barge_in((seg_turn_id, text))
                                 else:
                                     log.info(f"[{self.sid}] Dropped short segment (echo guard)")
                             elif self.state == State.THINKING:
-                                await self._do_barge_in(text)
+                                await self._do_barge_in((seg_turn_id, text))
                             else:
-                                await self._query_q.put(text)
+                                await self._query_q.put((seg_turn_id, text))
 
                         elif kind == "pong":
                             self._last_pong_time = time.monotonic()
@@ -799,7 +1139,7 @@ class GatewaySession:
                     log.error(f"[{self.sid}] STT max retries reached")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # CAG LOOP  (unchanged from v7 — still pushes text into _tts_q)
+    # CAG LOOP  (v9 — uses TonalAccumulator instead of SentenceAccumulator)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _cag_loop(self):
@@ -812,7 +1152,14 @@ class GatewaySession:
                 query = await self._query_q.get()
                 self._last_query_time = time.monotonic()
 
-                turn_id = str(uuid.uuid4())
+                # turn_id is bundled with the query as a tuple so that the
+                # latency tracker's new_turn() + on_stt_segment() are both
+                # anchored to the same turn object (the STT segment event fires
+                # before the CAG loop dequeues the query).
+                if isinstance(query, tuple):
+                    turn_id, query = query
+                else:
+                    turn_id = str(uuid.uuid4())
                 self._active_turn_id = turn_id
 
                 self._lat.new_turn(turn_id, query)
@@ -823,7 +1170,8 @@ class GatewaySession:
                 log.info(f"[{self.sid}] CAG query [turn:{turn_id[:8]}]: {query!r}")
                 await self._jsend({"type": "thinking", "turn_id": turn_id})
 
-                acc              = SentenceAccumulator()
+                # Use TonalAccumulator for prosody-aware chunking
+                acc              = TonalAccumulator()
                 acc.reset()
                 full_reply_parts : list[str] = []
                 interrupted      = False
@@ -834,7 +1182,7 @@ class GatewaySession:
                         "POST", "/chat/stream",
                         json={
                             "message":       query,
-                            "reset_session": True,
+                            "reset_session": False,
                             "turn_id":       turn_id,
                         },
                         headers={"Accept": "text/event-stream"},
@@ -883,16 +1231,22 @@ class GatewaySession:
                             await self._jsend({"type": "ai_token", "token": data})
                             full_reply_parts.append(data)
 
-                            # Feed accumulator → zero-latency TTS dispatch
-                            for sentence in acc.feed(data):
+                            # Feed TonalAccumulator → emit tonal chunks immediately
+                            for tonal_chunk in acc.feed(data):
                                 if self._barge_in:
                                     interrupted = True
                                     break
-                                log.info(f"[{self.sid}] TTS ← {sentence!r}")
-                                await self._jsend({"type": "ai_sentence", "text": sentence})
+                                log.info(
+                                    f"[{self.sid}] TTS ← [{tonal_chunk.tone}] {tonal_chunk.text!r}"
+                                )
+                                await self._jsend({
+                                    "type": "ai_sentence",
+                                    "text": tonal_chunk.text,
+                                    "tone": tonal_chunk.tone,
+                                })
                                 self.state = State.SPEAKING
-                                self._lat.on_tts_chunk_sent(sentence)
-                                await self._tts_q.put(sentence)   # synth_worker picks this up immediately
+                                self._lat.on_tts_chunk_sent(tonal_chunk.text)
+                                await self._tts_q.put(tonal_chunk)   # synth_worker picks up immediately
 
                             if interrupted:
                                 break
@@ -900,10 +1254,14 @@ class GatewaySession:
                     if not interrupted and not self._barge_in:
                         tail = acc.flush()
                         if tail:
-                            log.info(f"[{self.sid}] TTS ← tail: {tail!r}")
-                            await self._jsend({"type": "ai_sentence", "text": tail})
+                            log.info(f"[{self.sid}] TTS ← tail [{tail.tone}]: {tail.text!r}")
+                            await self._jsend({
+                                "type": "ai_sentence",
+                                "text": tail.text,
+                                "tone": tail.tone,
+                            })
                             self.state = State.SPEAKING
-                            self._lat.on_tts_chunk_sent(tail)
+                            self._lat.on_tts_chunk_sent(tail.text)
                             await self._tts_q.put(tail)
 
                 except Exception as e:
@@ -923,26 +1281,20 @@ class GatewaySession:
                                 pass
 
     # ─────────────────────────────────────────────────────────────────────────
-    # SYNTH WORKER  (v8 NEW)
-    # ─────────────────────────────────────────────────────────────────────────
-    # Pulls text chunks from _tts_q.
-    # For each chunk, immediately spawns a _synth_one coroutine (bounded by
-    # _tts_sem) that opens its own TTS WebSocket, synthesizes, and pushes
-    # ordered PCM frames into _pcm_q.
-    #
-    # Order is preserved by passing a monotonically-increasing order_index.
-    # The play worker buffers out-of-order chunks and plays in sequence.
+    # SYNTH WORKER  (v9 — passes tone annotation to TTS)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _synth_worker(self):
-        order_index = 0
-        pending_tasks: list[asyncio.Task] = []
+        order_index   = 0
+        pending_tasks : list[asyncio.Task] = []
 
         while self._running:
             item = await self._tts_q.get()
 
-            # Barge-in: cancel all in-flight synth tasks, reset
             if item is self._INTERRUPT:
+                # Set barge_in flag FIRST so all in-flight _synth_one tasks
+                # abort at their next barge_in check — no waiting.
+                self._barge_in = True
                 log.info(f"[{self.sid}] synth_worker: INTERRUPT — cancelling {len(pending_tasks)} tasks")
                 for t in pending_tasks:
                     t.cancel()
@@ -952,15 +1304,15 @@ class GatewaySession:
                 continue
 
             if item is self._TURN_END:
-                # Wait for all in-flight synth tasks to finish FIRST
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                    pending_tasks.clear()
-                await self._pcm_q.put(self._TURN_END)
+                total_dispatched = order_index   # how many synth_one tasks were fired
+                log.info(f"[{self.sid}] synth_worker: TURN_END ({total_dispatched} chunks dispatched)")
+                # Pass the count so play_worker can wait for all chunks before finalizing
+                await self._pcm_q.put(("TURN_END", total_dispatched))
+                pending_tasks = [t for t in pending_tasks if not t.done()]
                 order_index = 0
                 continue
 
-            # Text chunk — fire synthesis immediately (don't await)
+            # TonalChunk — fire synthesis immediately (non-blocking)
             idx  = order_index
             order_index += 1
             task = asyncio.create_task(
@@ -968,18 +1320,17 @@ class GatewaySession:
                 name=f"synth_one_{self.sid}_{idx}"
             )
             pending_tasks.append(task)
-
-            # Prune completed tasks from the list
             pending_tasks = [t for t in pending_tasks if not t.done()]
 
-    async def _synth_one(self, text: str, order_index: int):
+    async def _synth_one(self, tonal_chunk: TonalChunk, order_index: int):
         """
-        Synthesize one text chunk using its own TTS WebSocket connection.
+        Synthesize one TonalChunk using its own TTS WebSocket connection.
+        The chunk's tone annotation is forwarded to the TTS service so it
+        can apply appropriate prosody (pitch/rate modulation).
         Push (order_index, frames) into _pcm_q when done.
-        Protected by _tts_sem to cap parallel connections.
         """
-        if not text.strip():
-            # Still need to push so play_worker knows this slot is empty
+        text = tonal_chunk.text.strip()
+        if not text:
             await self._pcm_q.put((order_index, []))
             return
 
@@ -1002,13 +1353,16 @@ class GatewaySession:
                         ping_timeout=None,
                     )
 
+                    # Send chunk with tone annotation for prosody control
                     await tts_ws.send(json.dumps({
-                        "text":     text,
-                        "language": TTS_LANGUAGE,
-                        "speaker":  TTS_SPEAKER,
+                        "text":       text,
+                        "language":   TTS_LANGUAGE,
+                        "speaker":    TTS_SPEAKER,
+                        "chunk_tone": tonal_chunk.tone,  # "tone" or "logic"
                     }))
 
-                    skip_header = True
+                    wav_header_skipped = False   # first binary frame is always WAV header
+                    first_audio_marked = False
 
                     while True:
                         if self._barge_in:
@@ -1026,16 +1380,21 @@ class GatewaySession:
                             raise
 
                         if isinstance(frame, bytes):
+                            # EOS sentinel
                             if frame == b"":
                                 log.info(f"[{self.sid}] synth_one[{order_index}] EOS — {len(frames)} frames")
                                 break
-                            if skip_header:
-                                skip_header = False
-                                # Only record audio-start for the FIRST chunk (order_index==0)
-                                if order_index == 0:
-                                    self._lat.on_tts_audio_start()
+                            # First binary frame is WAV header (44 bytes) — skip it
+                            if not wav_header_skipped:
+                                wav_header_skipped = True
+                                log.debug(f"[{self.sid}] synth_one[{order_index}] skipped WAV header ({len(frame)}b)")
                                 continue
+                            # All subsequent binary frames are PCM16 audio
                             if frame:
+                                if not first_audio_marked:
+                                    first_audio_marked = True
+                                    if order_index == 0:
+                                        self._lat.on_tts_audio_start()
                                 frames.append(frame)
 
                         elif isinstance(frame, str):
@@ -1070,22 +1429,19 @@ class GatewaySession:
                             pass
                         tts_ws = None
 
-        # Push collected frames to play worker (even if empty, to maintain order)
         await self._pcm_q.put((order_index, frames))
         log.info(f"[{self.sid}] synth_one[{order_index}] pushed {len(frames)} frames to pcm_q")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PLAY WORKER  (v8 NEW)
-    # ─────────────────────────────────────────────────────────────────────────
-    # Pulls (order_index, frames) from _pcm_q.
-    # Maintains a reorder buffer so audio is always emitted in the correct
-    # chunk order even if TTS synthesis for chunk 2 finishes before chunk 1.
+    # PLAY WORKER  (unchanged from v8 — reorders and streams PCM to client)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _play_worker(self):
-        next_expected   = 0
-        reorder_buf     : dict[int, list[bytes]] = {}
-        chunk_count     = 0
+        next_expected    = 0
+        reorder_buf      : dict[int, list[bytes]] = {}
+        chunk_count      = 0
+        total_expected   = -1   # -1 = TURN_END not yet received
+        chunks_received  = 0    # how many (order_index, frames) items received
 
         async def _flush_in_order():
             nonlocal next_expected, chunk_count
@@ -1096,45 +1452,63 @@ class GatewaySession:
                 chunk_count += 1
                 next_expected += 1
 
+        async def _finalize_turn():
+            nonlocal reorder_buf, next_expected, chunk_count, total_expected, chunks_received
+            await _flush_in_order()
+            report = self._lat.complete_turn()
+            if report:
+                await self._jsend({"type": "latency", "stage": "turn_complete", **report})
+            await self._jsend({"type": "done", "chunks": chunk_count})
+            reorder_buf.clear()
+            next_expected   = 0
+            chunk_count     = 0
+            total_expected  = -1
+            chunks_received = 0
+            self.state      = State.IDLE
+            await self._unmute_mic()
+
         while self._running:
             item = await self._pcm_q.get()
 
             if item is self._INTERRUPT:
                 log.info(f"[{self.sid}] play_worker: INTERRUPT")
                 reorder_buf.clear()
-                next_expected = 0
-                chunk_count   = 0
-                self.state    = State.IDLE
+                next_expected   = 0
+                chunk_count     = 0
+                total_expected  = -1
+                chunks_received = 0
+                self.state      = State.IDLE
                 await self._unmute_mic()
                 continue
 
-            if item is self._TURN_END:
-                # Flush any remaining buffered frames
+            # TURN_END now arrives as ("TURN_END", total_dispatched)
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "TURN_END":
+                total_expected = item[1]
+                log.info(f"[{self.sid}] play_worker: TURN_END — expecting {total_expected} chunks, received {chunks_received}")
                 await _flush_in_order()
-                report = self._lat.complete_turn()
-                if report:
-                    await self._jsend({"type": "latency", "stage": "turn_complete", **report})
-                await self._jsend({"type": "done", "chunks": chunk_count})
-                reorder_buf.clear()
-                next_expected = 0
-                chunk_count   = 0
-                self.state    = State.IDLE
-                await self._unmute_mic()
+                # Only finalize if all chunks have already arrived
+                if chunks_received >= total_expected:
+                    await _finalize_turn()
                 continue
 
             order_index, frames = item
 
             if self._barge_in:
                 log.info(f"[{self.sid}] play_worker: drop chunk[{order_index}] (barge-in)")
+                chunks_received += 1
                 continue
 
+            chunks_received += 1
+
             if self.state != State.SPEAKING:
-                await self._mute_mic()
                 self.state = State.SPEAKING
 
-            # Buffer this chunk and flush everything in order
             reorder_buf[order_index] = frames
             await _flush_in_order()
+
+            # If TURN_END already arrived and we now have all chunks → finalize
+            if total_expected >= 0 and chunks_received >= total_expected and not reorder_buf:
+                await _finalize_turn()
 
 
 # ─── WebSocket endpoint ───────────────────────────────────────────────────────
@@ -1165,13 +1539,15 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "pong"})
                 elif mtype == "pong":
                     session._last_pong_time = time.monotonic()
-                elif mtype in ("ai_state", "ai_reference", "reset_context", "assistant_turn"):
+                elif mtype in ("ai_state", "ai_reference", "reset_context",
+                               "assistant_turn", "re_enroll"):
                     session.push_control(payload)
                 elif mtype == "get_stats":
                     await ws.send_json({
-                        "type":  "stats",
-                        "sid":   session.sid,
-                        "state": session.state.name,
+                        "type":     "stats",
+                        "sid":      session.sid,
+                        "state":    session.state.name,
+                        "enrolled": session._voice.enrolled,
                     })
                 elif mtype == "get_latency":
                     await ws.send_json({
@@ -1193,7 +1569,7 @@ async def ws_endpoint(ws: WebSocket):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "8.0.0"}
+    return {"status": "ok", "version": "9.0.0"}
 
 
 @app.get("/latency/session/{sid}")

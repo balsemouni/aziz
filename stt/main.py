@@ -116,8 +116,8 @@ def _make_pipeline() -> STTPipeline:
         ai_detector_model_path = None,
         ai_detection_threshold = 0.7,
         enable_aec             = True,
-        enable_enrollment      = True,   # v6: instant first-chunk enrollment
-        similarity_threshold   = 0.65,   # v6: loosened for single-chunk anchor
+        enable_enrollment      = True,   # v7: first-sentence enrollment
+        similarity_threshold   = 0.72,   # v7: tighter — full-sentence centroid is reliable
         overlap_seconds        = 0.8,
         word_gap_ms            = 80.0,
         max_context_words      = 40,
@@ -246,16 +246,30 @@ async def stream_audio_mux(websocket: WebSocket):
                     if etype == "enrollment":
                         enrolled = event.get("enrolled", False)
                         progress = event.get("progress", 0.0)
+                        reason   = event.get("reason", "")
                         pct      = int(progress * 100)
-                        if enrolled and not _last_enrolled_state:
+
+                        # Only fire enrolled confirmation when the profile locked
+                        # from a real first sentence (not noise, not single chunk).
+                        # reason="enrolled_first_sentence" is the only valid lock.
+                        is_real_lock = (
+                            enrolled
+                            and not _last_enrolled_state
+                            and reason == "enrolled_first_sentence"
+                        )
+
+                        if is_real_lock:
                             _last_enrolled_state    = True
                             _enrollment_log_counter = 100
-                            logger.info("[enroll] Speaker enrolled")
+                            logger.info("[enroll] Speaker enrolled (first sentence)")
                             await websocket.send_json({
-                                "type": "enrollment", "enrolled": True,
-                                "progress": 1.0, "message": "Speaker enrolled",
+                                "type":     "enrollment",
+                                "enrolled": True,
+                                "progress": 1.0,
+                                "message":  "Speaker enrolled",
                             })
                         elif not enrolled and pct != _enrollment_log_counter:
+                            # Show collecting progress (0-99%) while user speaks
                             _enrollment_log_counter = pct
                             await websocket.send_json(event)
                         continue

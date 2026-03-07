@@ -658,7 +658,20 @@ async def ws_tts(websocket: WebSocket):
     WebSocket TTS endpoint.
 
     Client → Server (JSON):
-        { "text": "...", "language": "en", "speaker_wav": null, "speaker": null }
+        {
+            "text":        "...",
+            "language":    "en",
+            "speaker_wav": null,
+            "speaker":     null,
+            "chunk_tone":  "tone" | "logic"   ← NEW (v9): prosody hint from gateway
+        }
+
+        chunk_tone values:
+          "tone"  → short expressive phrase (question / exclamation).
+                    TTS applies slightly higher pitch and moderate speaking rate.
+          "logic" → longer declarative statement.
+                    TTS applies neutral pitch and slightly slower rate for clarity.
+          absent  → default (same as "logic")
 
     Server → Client (mixed frames):
         Frame 1     : binary WAV header (44 bytes)
@@ -666,6 +679,11 @@ async def ws_tts(websocket: WebSocket):
                       JSON: { "type": "chunk_meta", "data": { ...ChunkMeta... } }
                       BIN : raw PCM16 bytes for that chunk
         Final frame : binary b""  (end-of-stream)
+
+    NOTE: The gateway sends ONE sentence per WebSocket connection (it opens a
+    fresh connection per tonal chunk).  The while-True loop below still works
+    correctly for that usage pattern (it will just process one message then
+    receive the connection close).
     """
     await websocket.accept()
     log.info("WebSocket connected: %s", websocket.client)
@@ -682,14 +700,37 @@ async def ws_tts(websocket: WebSocket):
             if active_job:
                 active_job.cancelled = True
 
-            chunks = chunker.split(text)
+            # ── Prosody hint from gateway ─────────────────────────────────────
+            chunk_tone = data.get("chunk_tone", "logic")   # "tone" | "logic"
+
+            # When the gateway pre-splits into tonal chunks, each message is a
+            # single complete phrase — we honour that and skip internal re-split
+            # to avoid destroying the prosodic boundary decisions already made.
+            # We wrap the whole text as a single AudioChunk with the correct type.
+            if chunk_tone == "tone":
+                ctype = ChunkType.TONE
+            else:
+                ctype = ChunkType.LOGIC
+
+            # Build a single-chunk job (gateway already did the splitting)
+            single_chunk = AudioChunk(
+                chunk_id    = str(uuid.uuid4())[:8],
+                chunk_type  = ctype,
+                text        = text,
+                chunk_index = 0,
+            )
             active_job = SynthesisJob(
                 job_id      = str(uuid.uuid4()),
                 text        = text,
                 language    = data.get("language", DEFAULT_LANGUAGE),
                 speaker_wav = data.get("speaker_wav"),
                 speaker     = data.get("speaker"),
-                chunks      = chunks,
+                chunks      = [single_chunk],
+            )
+
+            log.info(
+                "WS TTS synthesis: tone=%s  len=%d  text=%r",
+                chunk_tone, len(text), text[:60]
             )
 
             await websocket.send_bytes(build_wav_header(num_samples=0))
@@ -702,6 +743,7 @@ async def ws_tts(websocket: WebSocket):
                     "type": "chunk_meta",
                     "data": chunk_to_meta(chunk, include_audio=False),
                     "waveform": ChunkAudioDisplay.waveform(chunk.audio, width=40),
+                    "chunk_tone": chunk_tone,
                 })
                 await websocket.send_bytes(float32_to_pcm16(chunk.audio))
 
