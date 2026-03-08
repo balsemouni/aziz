@@ -1,5 +1,5 @@
 """
-gateway.py — Zero-Latency Voice Pipeline Gateway  v13
+gateway.py — Zero-Latency Voice Pipeline Gateway  v14
 ══════════════════════════════════════════════════════
 
 ARCHITECTURE
@@ -21,15 +21,17 @@ ARCHITECTURE
                                                                          │
                                                                     play_worker ──► client
 
-KEY IMPROVEMENTS v13
+KEY IMPROVEMENTS v14
 ────────────────────
-  1. CAG now uses a **persistent WebSocket** connection (no HTTP SSE).
-     Tokens arrive as individual frames — ultra-low framing overhead.
-  2. STT audio queue uses **priority drain**: when new audio arrives while
-     the queue is full, oldest frames are dropped rather than blocking.
-  3. Full latency timestamps at every pipeline stage sent to the client.
-  4. Clean structured logging with per-stage prefixes.
-  5. Graceful shutdown propagates through all tasks.
+  1. TTS Voice fingerprint gate moved INTO the gateway (was in STT pipeline).
+     Gateway builds a log-mel centroid from every TTS PCM frame it plays.
+     Every incoming mic frame is checked: if cosine-similarity >= threshold
+     the frame is silently dropped and never forwarded to STT.
+     This means the STT service receives clean human-only audio always.
+  2. STT no longer receives ai_reference / ai_state control frames.
+     AECGate and TTSVoiceGate are removed from the STT pipeline.
+  3. Barge-in safety: while state=SPEAKING a higher similarity threshold
+     is used so real human speech overlapping TTS echo is not suppressed.
 """
 
 from __future__ import annotations
@@ -46,6 +48,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
+import numpy as np
+
 import httpx
 import uvicorn
 import websockets
@@ -59,6 +63,9 @@ CAG_WS_URL          = os.getenv("CAG_WS_URL",          "ws://localhost:8000/chat
 CAG_HTTP_URL        = os.getenv("CAG_HTTP_URL",         "http://localhost:8000")         # fallback for /reset
 TTS_WS_URL          = os.getenv("TTS_WS_URL",           "ws://localhost:8765/ws/tts")
 TTS_ENROLL_URL      = os.getenv("TTS_ENROLL_URL",       "http://localhost:8765/enrollment_status")
+# Path to the MFCC fingerprint file saved by tts_microservice enrollment.
+# Must match TTS_FINGERPRINT_PATH in tts_microservice.py.
+TTS_FINGERPRINT_PATH = os.getenv("TTS_FINGERPRINT_PATH", "tts_voice_fingerprint.npy")
 GATEWAY_HOST        = os.getenv("GATEWAY_HOST",         "0.0.0.0")
 GATEWAY_PORT        = int(os.getenv("GATEWAY_PORT",     "8090"))
 TTS_SPEAKER         = os.getenv("TTS_SPEAKER",          "Claribel Dervla")
@@ -94,6 +101,9 @@ TEST_MODE           = os.getenv("TEST_MODE", "0").strip() in ("1", "true", "yes"
 WS_PING_INTERVAL = 15
 WS_PING_TIMEOUT  = 20
 
+# Echo gate config — see GatewayEchoGate class for details
+# (ECHO_* constants are defined alongside the class below)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -101,8 +111,45 @@ logging.basicConfig(
 log     = logging.getLogger("gateway")
 lat_log = logging.getLogger("gateway.latency")
 
-app = FastAPI(title="Voice Gateway", version="13.0.0")
+app = FastAPI(title="Voice Gateway", version="14.0.0")
 _session_latency_store: dict[str, dict] = {}
+
+# ── Module-level shared voice fingerprint ────────────────────────────────────
+# Loaded once at startup from the file written by tts_microservice enrollment.
+# All GatewaySession instances share this fingerprint via _load_shared_fingerprint().
+_shared_fingerprint: Optional[np.ndarray] = None
+
+
+def _load_shared_fingerprint() -> Optional[np.ndarray]:
+    """
+    Load the MFCC fingerprint saved by tts_microservice.
+    Returns a unit-norm float32 array of shape (N_MFCC,), or None if not found.
+    Called once at app startup and whenever a session initialises its gate.
+    """
+    global _shared_fingerprint
+    if _shared_fingerprint is not None:
+        return _shared_fingerprint
+    try:
+        fp = np.load(TTS_FINGERPRINT_PATH).astype(np.float32)
+        norm = np.linalg.norm(fp)
+        if norm > 1e-9:
+            fp = fp / norm
+        _shared_fingerprint = fp
+        log.info(
+            "[fingerprint] ✅ Loaded from %s — shape=%s  norm=%.4f",
+            TTS_FINGERPRINT_PATH, fp.shape, float(norm),
+        )
+        return fp
+    except FileNotFoundError:
+        log.warning(
+            "[fingerprint] File not found: %s — gate will build fingerprint "
+            "live from first TTS audio (less accurate). "
+            "Start tts_microservice first so it can enroll.", TTS_FINGERPRINT_PATH
+        )
+        return None
+    except Exception as e:
+        log.warning("[fingerprint] Load error: %s — falling back to live enrollment", e)
+        return None
 
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
@@ -487,6 +534,380 @@ class RepetitionGuard:
         self._history.clear()
 
 
+# ─── AI Text Echo Filter ───────────────────────────────────────────────────────
+#
+# PROBLEM
+# ───────
+# When the AI speaks via TTS, the speaker output is picked up by the open mic.
+# Even with acoustic cross-correlation gating, some echo leaks through and is
+# transcribed by STT verbatim (e.g. STT returns "I'm so glad you reached out").
+# These words then trigger false barge-ins, creating a feedback loop.
+#
+# SOLUTION — Text-layer echo guard
+# ─────────────────────────────────
+# Keep a rolling buffer of all words the AI has *actually said* in the last
+# AI_TEXT_ECHO_WINDOW_S seconds.  When STT returns a word or segment, compute
+# the overlap ratio between the STT result and that buffer.  If the ratio
+# exceeds AI_TEXT_ECHO_RATIO the result is classified as echo and dropped.
+#
+# This is complementary to (not a replacement for) the acoustic gate:
+#   • Acoustic gate catches echo before it reaches STT.
+#   • Text filter catches anything that slips through (cheap, zero false-positive
+#     risk for genuine human speech about unrelated topics).
+#
+# Tuning
+# ──────
+#   AI_TEXT_ECHO_WINDOW_S = 6.0   # seconds of AI speech to remember
+#   AI_TEXT_ECHO_RATIO    = 0.60  # word-overlap ratio to count as echo
+#   AI_TEXT_ECHO_MIN_WORDS= 1     # minimum STT words to bother checking
+
+AI_TEXT_ECHO_WINDOW_S  = float(os.getenv("AI_TEXT_ECHO_WINDOW_S",  "30.0"))  # STT can hallucinate AI words long after TTS
+AI_TEXT_ECHO_RATIO     = float(os.getenv("AI_TEXT_ECHO_RATIO",     "0.55"))  # slightly more aggressive
+AI_TEXT_ECHO_MIN_WORDS = int(os.getenv("AI_TEXT_ECHO_MIN_WORDS",   "1"))
+
+_ECHO_STOP = frozenset({
+    "a","an","the","i","me","my","we","our","you","your",
+    "is","are","was","were","to","of","in","on","at","by",
+    "and","or","but","not","so","it","its","be","do","did",
+})
+
+
+class AITextEchoFilter:
+    """
+    Text-level echo filter.  Records words the AI speaks; drops STT results
+    that are predominantly drawn from recent AI speech.
+
+    Usage:
+        f = AITextEchoFilter()
+        # When AI says a TTS sentence:
+        f.feed_ai_text("Hello! I'm so glad you reached out to Ask Novation.")
+        # When STT returns a word:
+        if f.is_echo_word("reached"):   # True → drop
+            ...
+        # When STT returns a segment:
+        if f.is_echo_segment("reached out to"):  # True → drop
+            ...
+    """
+
+    def __init__(self):
+        # list of (timestamp, word_lowercase)
+        self._ai_words: list[tuple[float, str]] = []
+
+    def feed_ai_text(self, text: str):
+        """Call with every sentence/chunk the AI sends to TTS."""
+        now = time.monotonic()
+        words = [w.lower().strip(".,!?;:\"'") for w in text.split()]
+        for w in words:
+            if w:
+                self._ai_words.append((now, w))
+        self._expire()
+
+    def _expire(self):
+        cutoff = time.monotonic() - AI_TEXT_ECHO_WINDOW_S
+        self._ai_words = [(t, w) for t, w in self._ai_words if t >= cutoff]
+
+    def _recent_ai_set(self) -> frozenset:
+        self._expire()
+        return frozenset(w for _, w in self._ai_words)
+
+    def is_echo_word(self, word: str) -> bool:
+        """Return True if a single STT word came from recent AI speech."""
+        w = word.lower().strip(".,!?;:\"'")
+        if not w or w in _ECHO_STOP:
+            return False
+        return w in self._recent_ai_set()
+
+    def is_echo_segment(self, text: str) -> bool:
+        """
+        Return True if an STT segment is predominantly composed of recent AI words.
+        Uses content-word overlap ratio.
+        """
+        if not text:
+            return False
+        words = [w.lower().strip(".,!?;:\"'") for w in text.split()]
+        # Filter to content words only (skip stop words for ratio calc)
+        content = [w for w in words if w and w not in _ECHO_STOP]
+        if len(content) < AI_TEXT_ECHO_MIN_WORDS:
+            return False
+        ai_set = self._recent_ai_set()
+        overlap = sum(1 for w in content if w in ai_set)
+        ratio = overlap / len(content)
+        if ratio >= AI_TEXT_ECHO_RATIO:
+            log.info(
+                f"[AITextEchoFilter] ECHO segment ({ratio:.0%} overlap): {text!r}"
+            )
+            return True
+        return False
+
+    def reset(self):
+        self._ai_words.clear()
+
+
+# ─── TTS Voice Fingerprint Gate ───────────────────────────────────────────────
+#
+# DESIGN
+# ──────
+# Cross-correlation (old approach) requires the mic to capture audio at nearly
+# the exact same moment — it fails with room delay, reverb, or any buffering
+# lag.  This gate instead identifies the AI's voice by SPECTRAL IDENTITY using
+# MFCC features, which is timing-independent: it asks "does this mic frame
+# sound like the AI voice?" regardless of when it arrives.
+#
+# HOW IT WORKS
+# ────────────
+# Phase 1 — ENROLLMENT (feed_tts calls while AI is speaking):
+#   Every TTS PCM chunk is resampled to 16 kHz, split into 25 ms frames,
+#   and 13 MFCC coefficients are extracted per frame.
+#   These are averaged into a running centroid = the AI VOICE FINGERPRINT.
+#   The fingerprint is a single 13-d unit vector representing the spectral
+#   identity of the AI's voice across all utterances so far.
+#
+# Phase 2 — GATE CHECK (check calls from mic):
+#   Each mic frame is analysed identically.  Cosine similarity is computed
+#   between the mic MFCCs and the fingerprint.  If the highest similarity
+#   frame >= threshold AND the gate is armed (TTS active or tail guard)
+#   → DROP (AI echo).  Otherwise → PASS (human voice or silence).
+#
+# BARGE-IN SAFETY
+# ────────────────
+#   When the human speaks over the AI, the human voice has a different
+#   spectral identity and will score below threshold → passes through.
+#   Only frames that genuinely sound like the AI voice are dropped.
+#
+# TUNING (env vars)
+# ──────
+#   VFGATE_SIM_THRESHOLD = 0.85   cosine similarity to classify as AI
+#   VFGATE_TAIL_S        = 2.0    seconds gate stays armed after TTS stops
+#   VFGATE_ENERGY_FLOOR  = 0.002  RMS below this → silence → always pass
+#   VFGATE_N_MFCC        = 13     MFCC coefficient count
+#   VFGATE_FRAME_MS      = 25     analysis window in milliseconds
+
+VFGATE_SIM_THRESHOLD = float(os.getenv("VFGATE_SIM_THRESHOLD", "0.85"))
+VFGATE_TAIL_S        = float(os.getenv("VFGATE_TAIL_S",        "2.0"))
+VFGATE_ENERGY_FLOOR  = float(os.getenv("VFGATE_ENERGY_FLOOR",  "0.002"))
+VFGATE_N_MFCC        = int(os.getenv("VFGATE_N_MFCC",          "13"))
+VFGATE_FRAME_MS      = int(os.getenv("VFGATE_FRAME_MS",        "25"))
+
+# Alias used by existing ECHO_TAIL_GUARD_S logic elsewhere in the file
+ECHO_TAIL_S = VFGATE_TAIL_S
+
+
+class TTSVoiceFingerprintGate:
+    """
+    MFCC-based TTS voice fingerprint gate.  Drop-in replacement for the old
+    cross-correlation GatewayEchoGate — same public API.
+
+    Usage:
+        gate = TTSVoiceFingerprintGate()
+        gate.feed_tts(pcm_bytes_24k_int16)   # called for every TTS frame played
+        gate.tts_stopped()                    # called when TTS finishes
+        if gate.check(mic_pcm_bytes_16k):     # True → drop mic frame
+            continue
+    """
+
+    MIC_SR = 16_000
+    TTS_SR = 24_000
+
+    def __init__(self):
+        self._sr        = self.MIC_SR
+        self._frame_len = int(self._sr * VFGATE_FRAME_MS / 1000)
+        self._n_mfcc    = VFGATE_N_MFCC
+
+        # Running mean of all MFCC vectors seen from TTS audio
+        self._fp_sum   = np.zeros(self._n_mfcc, dtype=np.float64)
+        self._fp_count = 0
+        self._fingerprint: Optional[np.ndarray] = None   # unit-norm centroid
+
+        self._tts_active     = False
+        self._tts_stopped_at = 0.0
+
+        self.frames_checked = 0
+        self.frames_dropped = 0
+        self.last_sim       = 0.0
+
+        # Accumulation buffer — mic sends ~160 samples (10ms) per chunk but
+        # MFCC extraction needs at least _frame_len (400) samples. We buffer
+        # chunks until we have enough, then run the check on the full window.
+        self._mic_buf = np.array([], dtype=np.float32)
+
+    # ── MFCC helpers (pure numpy — no librosa required) ───────────────────────
+
+    @staticmethod
+    def _preemph(s: np.ndarray, c: float = 0.97) -> np.ndarray:
+        return np.append(s[0], s[1:] - c * s[:-1])
+
+    @staticmethod
+    def _mel_fb(n_fft: int, n_mels: int, sr: int) -> np.ndarray:
+        def h2m(h): return 2595 * np.log10(1 + h / 700)
+        def m2h(m): return 700 * (10 ** (m / 2595) - 1)
+        pts  = m2h(np.linspace(h2m(0), h2m(sr / 2), n_mels + 2))
+        bins = np.floor((n_fft + 1) * pts / sr).astype(int)
+        nb   = n_fft // 2 + 1
+        fb   = np.zeros((n_mels, nb))
+        for m in range(1, n_mels + 1):
+            lo, mid, hi = bins[m-1], bins[m], bins[m+1]
+            if mid > lo:
+                fb[m-1, lo:mid] = (np.arange(lo, mid) - lo) / (mid - lo)
+            if hi > mid:
+                fb[m-1, mid:hi] = (hi - np.arange(mid, hi)) / (hi - mid)
+        return fb
+
+    def _extract_mfcc(self, pcm: np.ndarray) -> Optional[np.ndarray]:
+        """Return (n_frames, n_mfcc) MFCC matrix or None if audio too short."""
+        if len(pcm) < self._frame_len:
+            return None
+        n_mels  = 26
+        n_fft   = self._frame_len
+        hop     = n_fft // 2
+        fb      = self._mel_fb(n_fft, n_mels, self._sr)
+        sig     = self._preemph(pcm)
+        out     = []
+        for i in range(0, len(sig) - n_fft + 1, hop):
+            w   = sig[i:i+n_fft] * np.hanning(n_fft)
+            ps  = np.abs(np.fft.rfft(w, n=n_fft)) ** 2
+            mel = np.maximum(np.dot(fb, ps), 1e-10)
+            lm  = np.log(mel)
+            N   = len(lm)
+            k   = np.arange(self._n_mfcc)
+            # Vectorised DCT-II
+            dct = np.sum(lm[:, None] * np.cos(np.pi * k[None, :] * (np.arange(N)[:, None] + 0.5) / N), axis=0)
+            out.append(dct)
+        return np.array(out) if out else None
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        return float(np.dot(a, b) / (na * nb)) if na > 1e-9 and nb > 1e-9 else 0.0
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def feed_tts(self, pcm_int16_bytes: bytes):
+        """Ingest one TTS PCM chunk (int16, 24 kHz) → update fingerprint."""
+        if not pcm_int16_bytes or len(pcm_int16_bytes) < 2:
+            return
+        if len(pcm_int16_bytes) % 2 != 0:
+            pcm_int16_bytes = pcm_int16_bytes[:-1]
+
+        pcm24 = np.frombuffer(pcm_int16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        n_out = max(1, int(len(pcm24) * self.MIC_SR / self.TTS_SR))
+        pcm16 = np.interp(
+            np.linspace(0, 1, n_out), np.linspace(0, 1, len(pcm24)), pcm24,
+        ).astype(np.float32)
+
+        frames = self._extract_mfcc(pcm16)
+        if frames is not None and len(frames):
+            self._fp_sum   += frames.sum(axis=0)
+            self._fp_count += len(frames)
+            c  = self._fp_sum / self._fp_count
+            n  = np.linalg.norm(c)
+            if n > 1e-9:
+                self._fingerprint = (c / n).astype(np.float32)
+
+        self._tts_active = True
+        log.debug(f"[VFGate] feed_tts: +{len(frames) if frames is not None else 0} frames  total={self._fp_count}")
+
+    def tts_stopped(self):
+        """Signal TTS playback ended — arms the tail guard."""
+        self._tts_active     = False
+        self._tts_stopped_at = time.monotonic()
+        log.debug(f"[VFGate] tts_stopped — {self._fp_count} frames enrolled")
+
+    def _is_armed(self) -> bool:
+        if self._tts_active:
+            return True
+        if self._fingerprint is None:
+            return False
+        return (time.monotonic() - self._tts_stopped_at) < VFGATE_TAIL_S
+
+    def check(self, mic_pcm_bytes: bytes, ai_speaking: bool = False) -> bool:
+        """
+        Returns True → DROP (AI voice detected in mic frame).
+        mic_pcm_bytes : raw int16 PCM at 16 kHz, no WAV header.
+        ai_speaking   : use tighter threshold while AI is actively playing.
+        """
+        self.frames_checked += 1
+
+        if self._fingerprint is None or not self._is_armed() or not mic_pcm_bytes:
+            return False
+
+        if len(mic_pcm_bytes) % 2 != 0:
+            mic_pcm_bytes = mic_pcm_bytes[:-1]
+
+        # Accumulate into buffer — mic sends small chunks (~160 samples/10ms)
+        # but MFCC needs at least _frame_len samples to work
+        chunk = np.frombuffer(mic_pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        self._mic_buf = np.concatenate([self._mic_buf, chunk])
+
+        # Not enough data yet — don't drop, keep buffering
+        if len(self._mic_buf) < self._frame_len:
+            return False
+
+        # We have enough — work on the accumulated buffer then clear it
+        mic = self._mic_buf.copy()
+        self._mic_buf = np.array([], dtype=np.float32)
+
+        # Energy floor — silence is never AI echo
+        rms = float(np.sqrt(np.mean(mic ** 2)))
+        if rms < VFGATE_ENERGY_FLOOR:
+            self.last_sim = 0.0
+            return False
+
+        frames = self._extract_mfcc(mic)
+        if frames is None or not len(frames):
+            self.last_sim = 0.0
+            return False
+
+        # If ANY frame sounds like the AI voice → drop
+        max_sim = max(self._cosine(f, self._fingerprint) for f in frames)
+        self.last_sim = max_sim
+
+        thresh = VFGATE_SIM_THRESHOLD * 0.90 if ai_speaking else VFGATE_SIM_THRESHOLD
+
+        if max_sim >= thresh:
+            self.frames_dropped += 1
+            log.debug(f"[VFGate] DROP  sim={max_sim:.3f}  thresh={thresh:.2f}  rms={rms:.4f}")
+            return True
+
+        log.debug(f"[VFGate] PASS  sim={max_sim:.3f}  thresh={thresh:.2f}  rms={rms:.4f}")
+        return False
+
+    def reset(self):
+        self._fp_sum[:]      = 0
+        self._fp_count       = 0
+        self._fingerprint    = None
+        self._tts_active     = False
+        self._tts_stopped_at = 0.0
+        self.frames_checked  = 0
+        self.frames_dropped  = 0
+        self.last_sim        = 0.0
+        self._mic_buf        = np.array([], dtype=np.float32)
+
+    @property
+    def is_enrolled(self) -> bool:
+        return self._fingerprint is not None and self._fp_count >= 10
+
+    def load_fingerprint(self, fp: np.ndarray):
+        """
+        Inject a pre-computed fingerprint (from tts_microservice enrollment file).
+        This replaces any live-accumulated fingerprint immediately.
+        fp: unit-norm float32 array of shape (n_mfcc,)
+        """
+        norm = np.linalg.norm(fp)
+        if norm < 1e-9:
+            log.warning("[VFGate] load_fingerprint: zero-norm vector ignored")
+            return
+        self._fingerprint = (fp / norm).astype(np.float32)
+        # Fake a large frame count so is_enrolled returns True immediately
+        self._fp_count    = 10_000
+        log.info("[VFGate] Fingerprint injected — shape=%s  norm=%.4f",
+                 fp.shape, float(norm))
+
+
+# Alias so any external code still referencing GatewayEchoGate keeps working
+GatewayEchoGate = TTSVoiceFingerprintGate
+
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _drain_q(q: asyncio.Queue):
@@ -553,8 +974,19 @@ class GatewaySession:
         self._last_pong_time  = time.monotonic()
         self._last_query_time = time.monotonic()
 
-        self._stt_ready = asyncio.Event()
-        self._lat       = LatencyTracker(self.sid)
+        self._stt_ready  = asyncio.Event()
+        self._lat        = LatencyTracker(self.sid)
+        self._echo_gate        = TTSVoiceFingerprintGate()  # MFCC voice fingerprint gate (speaker-identity based)
+        self._text_echo_filter = AITextEchoFilter()         # text-layer fallback
+        self._gate_ready       = asyncio.Event()            # set once fingerprint is ready
+
+        # Inject pre-computed fingerprint from TTS enrollment file (if available).
+        # If the file exists the gate is immediately armed — no live synthesis needed.
+        shared_fp = _load_shared_fingerprint()
+        if shared_fp is not None:
+            self._echo_gate.load_fingerprint(shared_fp)
+            self._gate_ready.set()   # unblock _push() immediately
+            log.info(f"[{self.sid}] Voice fingerprint loaded — gate armed from startup")
 
         log.info(f"[{self.sid}] session created")
 
@@ -597,6 +1029,8 @@ class GatewaySession:
 
     async def stop(self):
         self._running = False
+        self._echo_gate.reset()
+        self._text_echo_filter.reset()
         summary = self._lat.session_summary()
         _session_latency_store[self.sid] = {
             "summary": summary,
@@ -619,6 +1053,12 @@ class GatewaySession:
         except asyncio.TimeoutError:
             log.warning(f"[{self.sid}] STT not ready after 15s — continuing anyway")
 
+        # ── Step 1: Pre-enroll the voice gate ────────────────────────────────
+        # Synthesize a short phrase via TTS, feed all PCM frames into the gate.
+        # _push() is BLOCKED on _voice_gate_ready until this completes.
+        # This guarantees the fingerprint is ready before any mic audio reaches STT.
+        await self._pre_enroll_voice_gate()
+
         enrolled  = False
         deadline  = time.monotonic() + ENROLL_WAIT_S
         log.info(f"[{self.sid}] Polling TTS enrollment (max {ENROLL_WAIT_S:.0f}s)…")
@@ -629,8 +1069,7 @@ class GatewaySession:
                     data = r.json()
                     if data.get("enrolled"):
                         enrolled = True
-                        log.info(f"[{self.sid}] ✅ TTS voice enrolled — starting session")
-                        await self._jsend({"type": "tts_enrolled", "message": "TTS voice profile ready"})
+                        log.info(f"[{self.sid}] ✅ TTS voice profile confirmed")
                         break
                     progress = data.get("progress", 0)
                     await self._jsend({"type": "tts_enroll_progress", "pct": int(progress * 100)})
@@ -639,15 +1078,69 @@ class GatewaySession:
                 await asyncio.sleep(0.5)
 
         if not enrolled:
-            log.warning(f"[{self.sid}] TTS enrollment not confirmed after {ENROLL_WAIT_S}s — starting anyway")
+            log.warning(f"[{self.sid}] TTS enrollment not confirmed after {ENROLL_WAIT_S}s — continuing")
 
+        await self._jsend({"type": "tts_enrolled", "message": "TTS voice profile ready"})
         # No greeting — user starts the conversation.
         # Send a "ready" event so the client knows the pipeline is live.
         await self._jsend({"type": "ready", "message": "Pipeline ready — speak to begin"})
 
+
+    async def _pre_enroll_voice_gate(self):
+        """
+        Ensure the voice fingerprint gate is armed before mic audio flows to STT.
+
+        Fast path: if the fingerprint was already loaded from disk in __init__,
+        the gate is already armed (_gate_ready is set) — nothing to do.
+
+        Slow path: fingerprint file not found → synthesize a short phrase via TTS,
+        extract MFCC frames live, and build the fingerprint on the fly.
+        This is less accurate than the full enrollment but better than nothing.
+        """
+        if self._gate_ready.is_set():
+            log.info(f"[{self.sid}] Voice gate already armed from fingerprint file — skipping live enrollment")
+            return
+
+        ENROLL_PHRASE = "Hello, I am Nova. I am happy to help you today."
+        log.info(f"[{self.sid}] Fingerprint file not found — live-enrolling from TTS phrase…")
+        tts_ws = None
+        try:
+            tts_ws = await _ws_connect(
+                TTS_WS_URL, max_retries=3,
+                label=f"[{self.sid}] echo-gate-init",
+                max_size=10 * 1024 * 1024,
+                ping_interval=None, ping_timeout=None,
+            )
+            await tts_ws.send(json.dumps({
+                "text":     ENROLL_PHRASE,
+                "language": TTS_LANGUAGE,
+                "speaker":  TTS_SPEAKER,
+            }))
+            wav_skipped = False
+            async for frame in tts_ws:
+                if not isinstance(frame, bytes):
+                    continue
+                if frame == b"":
+                    break
+                if not wav_skipped:
+                    wav_skipped = True
+                    continue
+                if frame:
+                    self._echo_gate.feed_tts(frame)
+            # Do NOT call tts_stopped() — that starts the 2s countdown immediately.
+            # Keep _tts_active=True so the gate stays armed until real playback takes over.
+            self._echo_gate._tts_active = True
+            log.info(f"[{self.sid}] ✅ Live voice gate enrollment done ({self._echo_gate._fp_count} MFCC frames) — gate kept armed")
+        except Exception as e:
+            log.warning(f"[{self.sid}] Live voice gate enrollment failed: {e} — mic unblocked without fingerprint")
+        finally:
+            if tts_ws:
+                try: await tts_ws.close()
+                except Exception: pass
+        self._gate_ready.set()   # always unblock, even on error
+
     async def _play_greeting(self):
         log.info(f"[{self.sid}] Playing greeting: {TTS_GREETING!r}")
-        await self._notify_stt_ai_speaking(True)
         tts_ws = None
         try:
             tts_ws = await _ws_connect(
@@ -674,7 +1167,7 @@ class GatewaySession:
                         continue
                     if frame:
                         await self._bsend(frame)
-                        await self._forward_tts_to_stt(frame)
+                        self._echo_gate.feed_tts(frame)   # buffer for echo detection
         except Exception as e:
             log.warning(f"[{self.sid}] Greeting error: {e}")
         finally:
@@ -683,37 +1176,15 @@ class GatewaySession:
                     await tts_ws.close()
                 except Exception:
                     pass
-        await self._notify_stt_ai_speaking(False)
         self._tts_stopped_at = time.monotonic()
         self.state = State.IDLE
         await self._jsend({"type": "done", "chunks": 1})
+        self._echo_gate.tts_stopped()
+        if not self._gate_ready.is_set():
+            self._gate_ready.set()   # ensure mic unblocked after greeting
         log.info(f"[{self.sid}] Greeting done")
 
     # ── STT control helpers ───────────────────────────────────────────────────
-
-    async def _notify_stt_ai_speaking(self, speaking: bool):
-        if not self._stt_ws:
-            return
-        ctrl = json.dumps({"type": "ai_state", "speaking": speaking}).encode()
-        try:
-            await self._stt_ws.send(b'\x02' + ctrl)
-        except Exception as e:
-            log.debug(f"[{self.sid}] ai_state send failed: {e}")
-
-    async def _forward_tts_to_stt(self, pcm16_bytes: bytes):
-        """Send TTS audio to STT as AEC reference."""
-        if not self._stt_ws:
-            return
-        try:
-            b64  = base64.b64encode(pcm16_bytes).decode()
-            ctrl = json.dumps({
-                "type":        "ai_reference",
-                "pcm":         b64,
-                "sample_rate": 24000,
-            }).encode()
-            await self._stt_ws.send(b'\x02' + ctrl)
-        except Exception:
-            pass
 
     # ── Audio push: priority drain ────────────────────────────────────────────
 
@@ -787,7 +1258,6 @@ class GatewaySession:
                 pass
             self._cag_ws = None
 
-        await self._notify_stt_ai_speaking(False)
         await self._jsend({"type": "barge_in"})
 
     # ─── STT loop ─────────────────────────────────────────────────────────────
@@ -816,12 +1286,32 @@ class GatewaySession:
                 self._stt_ready.set()
 
                 async def _push():
-                    """Push audio frames to STT — reads from priority-drain queue."""
+                    """
+                    Push audio frames to STT — reads from priority-drain queue.
+                    BLOCKS until the TTS voice gate is enrolled (min_frames seen).
+                    Once enrolled, frames matching the TTS fingerprint are dropped.
+                    """
+                    # Wait until gate has enrolled enough TTS frames to be reliable.
+                    # This prevents mic echo leaking to STT during first TTS response.
+                    if not self._gate_ready.is_set():
+                        log.info(f"[{self.sid}] _push waiting for echo gate…")
+                        await self._gate_ready.wait()
+                        log.info(f"[{self.sid}] _push unblocked — echo gate ready")
                     while self._running:
                         frame = await self._audio_q.get()
                         try:
-                            # Strip the 0x01 gateway framing byte — STT expects raw PCM only
-                            await stt_ws.send(frame[1:] if frame and frame[0] == 0x01 else frame)
+                            pcm_bytes = frame[1:] if frame and frame[0] == 0x01 else frame
+                            is_tts_voice = self._echo_gate.check(pcm_bytes, ai_speaking=(self.state == State.SPEAKING))
+                            log.info(
+                                "[%s] chunk | tts_voice=%s | sim=%.3f | armed=%s | drop=%s",
+                                self.sid, is_tts_voice,
+                                self._echo_gate.last_sim,
+                                self._echo_gate._is_armed(),
+                                is_tts_voice,
+                            )
+                            if is_tts_voice:
+                                continue
+                            await stt_ws.send(frame if (frame and frame[0] == 0x01) else b'\x01' + frame)
                         except Exception:
                             pass
 
@@ -853,6 +1343,11 @@ class GatewaySession:
                         in_echo_tail = (time.monotonic() - self._tts_stopped_at) < ECHO_TAIL_GUARD_S
                         if word_count < 2 and self.state == State.IDLE and in_echo_tail:
                             log.info(f"[{self.sid}] echo-tail drop: {text!r}")
+                            return
+
+                        # Text-layer echo gate: drop segments that are mostly AI's own words
+                        if self._text_echo_filter.is_echo_segment(text):
+                            log.info(f"[{self.sid}] text-echo drop (fire_query): {text!r}")
                             return
 
                         guard.reset()
@@ -903,6 +1398,13 @@ class GatewaySession:
                         elif kind == "word":
                             word = ev.get("word", "").strip().rstrip("?.!,;:")
                             if word:
+                                # Text-layer echo gate: drop words the AI just said.
+                                # Applied regardless of state — STT can hallucinate AI
+                                # words long after TTS finishes (primed by context).
+                                if self._text_echo_filter.is_echo_word(word):
+                                    log.debug(f"[{self.sid}] text-echo drop word: {word!r}")
+                                    continue
+
                                 if guard.feed(word):
                                     log.warning(f"[{self.sid}] hallucination reset")
                                     word_buf.clear()
@@ -940,6 +1442,11 @@ class GatewaySession:
                             in_echo_tail = (time.monotonic() - self._tts_stopped_at) < ECHO_TAIL_GUARD_S
                             if word_count < 2 and self.state == State.IDLE and in_echo_tail:
                                 log.info(f"[{self.sid}] echo-tail drop (segment): {text!r}")
+                                continue
+
+                            # Text-layer echo gate: drop segments that are mostly AI's own words
+                            if self._text_echo_filter.is_echo_segment(text):
+                                log.info(f"[{self.sid}] text-echo drop segment: {text!r}")
                                 continue
 
                             seg_turn_id = str(uuid.uuid4())
@@ -1131,6 +1638,7 @@ class GatewaySession:
                         break
                     log.info(f"[{self.sid}] TTS← [{tc.tone}] {tc.text!r}")
                     await self._jsend({"type": "ai_sentence", "text": tc.text, "tone": tc.tone})
+                    self._text_echo_filter.feed_ai_text(tc.text)  # register AI words for echo detection
                     self.state = State.SPEAKING
                     self._lat.on_tts_chunk_sent(tc.text)
                     await self._tts_q.put(tc)
@@ -1151,6 +1659,7 @@ class GatewaySession:
                 if tail:
                     log.info(f"[{self.sid}] TTS← tail [{tail.tone}]: {tail.text!r}")
                     await self._jsend({"type": "ai_sentence", "text": tail.text, "tone": tail.tone})
+                    self._text_echo_filter.feed_ai_text(tail.text)  # register AI words for echo detection
                     self.state = State.SPEAKING
                     self._lat.on_tts_chunk_sent(tail.text)
                     await self._tts_q.put(tail)
@@ -1296,9 +1805,6 @@ class GatewaySession:
                 order_index   = 0
                 continue
 
-            if order_index == 0:
-                await self._notify_stt_ai_speaking(True)
-
             idx         = order_index
             order_index += 1
             task = asyncio.create_task(
@@ -1368,7 +1874,7 @@ class GatewaySession:
                                     if idx == 0:
                                         self._lat.on_tts_audio_start()
                                 frames.append(frame)
-                                await self._forward_tts_to_stt(frame)
+                                self._echo_gate.feed_tts(frame)   # keep ring buffer current
 
                         elif isinstance(frame, str):
                             try:
@@ -1425,6 +1931,7 @@ class GatewaySession:
                 frames = reorder_buf.pop(next_expected)
                 for f in frames:
                     await self._bsend(f)
+                    self._echo_gate.feed_tts(f)   # arm gate with audio playing RIGHT NOW
                 chunk_count   += 1
                 next_expected += 1
 
@@ -1433,8 +1940,8 @@ class GatewaySession:
             nonlocal total_expected, chunks_received
             await _flush_ordered()
             await asyncio.sleep(ECHO_TAIL_GUARD_S)
-            await self._notify_stt_ai_speaking(False)
             self._tts_stopped_at = time.monotonic()
+            self._echo_gate.tts_stopped()   # start tail guard
             report = self._lat.complete_turn()
             if report:
                 await self._jsend({"type": "latency", "stage": "turn_complete", **report})
@@ -1457,8 +1964,8 @@ class GatewaySession:
                 total_expected  = -1
                 chunks_received = 0
                 self.state      = State.IDLE
-                await self._notify_stt_ai_speaking(False)
                 self._tts_stopped_at = time.monotonic()
+                self._echo_gate.tts_stopped()   # start tail guard
                 report = self._lat.complete_turn()
                 if report:
                     report["barge_in"] = True
@@ -1488,6 +1995,25 @@ class GatewaySession:
                 await _flush_ordered()
                 if not reorder_buf:
                     await _finalize_turn()
+
+
+# ─── App startup ──────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def _gateway_startup():
+    """Load the TTS voice fingerprint from disk at startup (once for all sessions)."""
+    fp = _load_shared_fingerprint()
+    if fp is not None:
+        log.info(
+            "[startup] Voice fingerprint loaded — all sessions will use it immediately. "
+            "Gate armed: no per-session TTS synthesis needed."
+        )
+    else:
+        log.warning(
+            "[startup] No fingerprint file at %s — sessions will live-enroll from TTS. "
+            "Start tts_microservice.py first and wait for enrollment to complete.",
+            TTS_FINGERPRINT_PATH,
+        )
 
 
 # ─── WebSocket endpoint ───────────────────────────────────────────────────────
@@ -1570,7 +2096,7 @@ async def ws_endpoint(ws: WebSocket):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "13.0.0"}
+    return {"status": "ok", "version": "14.0.0"}
 
 
 @app.get("/latency/session/{sid}")

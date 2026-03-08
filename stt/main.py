@@ -1,5 +1,5 @@
 """
-main.py — STT microservice  v5.3.0
+main.py — STT microservice  v5.4.0
 ────────────────────────────────────────────────────────────────────────────
 
 FIXES vs v5.2
@@ -66,7 +66,7 @@ logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("pipeline").setLevel(logging.INFO)
 
-app = FastAPI(title="STT Microservice", version="5.3.0")
+app = FastAPI(title="STT Microservice", version="5.4.0")
 
 MIN_SEGMENT_CHARS = 3
 MAX_REPEATS       = 3
@@ -269,22 +269,13 @@ async def stream_audio_mux(websocket: WebSocket):
     _reset_asr_context(pipeline)
 
     diag_count:    int  = 0
-    # FIX 2: Track last known ai_speaking state to de-duplicate notifications
-    _last_ai_speaking: bool = False
-
     try:
         async for message in websocket.iter_bytes():
             if len(message) < 1:
                 continue
 
-            # Gateway strips 0x01 before sending to STT (gateway.py _push).
-            # Audio arrives as raw PCM (no header). Control frames keep 0x02.
-            if message[0] == 0x02:
-                frame_type = 0x02
-                payload    = message[1:]
-            else:
-                frame_type = 0x01  # raw PCM from gateway
-                payload    = message
+            frame_type = message[0]
+            payload    = message[1:]
 
             # ── Audio frame (0x01) ────────────────────────────────────────
             if frame_type == 0x01:
@@ -338,45 +329,7 @@ async def stream_audio_mux(websocket: WebSocket):
                     ctrl     = json.loads(payload.decode("utf-8"))
                     msg_type = ctrl.get("type")
 
-                    if msg_type == "ai_state":
-                        speaking = bool(ctrl.get("speaking", False))
-
-                        # FIX 2: Only act + log when the state actually changes.
-                        # The gateway sends ai_state=False from multiple tasks
-                        # (synth_worker, play_worker, finalize_turn). Without
-                        # this guard the log fills with repeated False entries
-                        # and notify_ai_speaking() resets barge-in state
-                        # multiple times unnecessarily.
-                        if speaking != _last_ai_speaking:
-                            _last_ai_speaking = speaking
-                            logger.info(f"[ctrl] AI speaking → {speaking}")
-                            pipeline.notify_ai_speaking(speaking)
-                        # else: silently ignore duplicate
-
-                    elif msg_type == "ai_reference":
-                        b64 = ctrl.get("pcm", "")
-                        if b64:
-                            raw_bytes = base64.b64decode(b64)
-                            ref = (
-                                np.frombuffer(raw_bytes, dtype=np.int16)
-                                .astype(np.float32) / 32768.0
-                            )
-                            tts_sr = ctrl.get("sample_rate", 24000)
-                            if tts_sr != 16000 and len(ref) > 0:
-                                try:
-                                    from math import gcd as _g
-                                    from scipy.signal import resample_poly as _rp
-                                    g   = _g(16000, tts_sr)
-                                    ref = _rp(ref, 16000//g, tts_sr//g).astype(np.float32)
-                                except ImportError:
-                                    n   = int(len(ref) * 16000 / tts_sr)
-                                    ref = np.interp(
-                                        np.linspace(0,1,n),
-                                        np.linspace(0,1,len(ref)), ref
-                                    ).astype(np.float32)
-                            pipeline.push_ai_reference(ref)
-
-                    elif msg_type == "assistant_turn":
+                    if msg_type == "assistant_turn":
                         text = ctrl.get("text", "").strip()
                         if text:
                             pipeline.add_assistant_turn(text)
@@ -391,8 +344,8 @@ async def stream_audio_mux(websocket: WebSocket):
                     elif msg_type == "get_stats":
                         await websocket.send_json({"type": "stats", **pipeline.get_stats()})
 
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                    logger.warning(f"[ctrl] bad payload: {e}")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass  # WS ping/pong frames occasionally land here — ignore
 
             # ── Unknown frame type — silently drop ────────────────────────
             # WebSocket library ping (0x89) / pong (0x8a) / close (0x88)
@@ -468,7 +421,7 @@ def health():
     )
     return {
         "status":              "ok",
-        "version":             "5.3.0",
+        "version":             "5.4.0",
         "pipeline_ready":      pipeline is not None,
         "voice_gate_enrolled": vg_ready,
     }

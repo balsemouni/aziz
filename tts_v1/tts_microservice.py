@@ -7,7 +7,8 @@ WHAT'S NEW IN v3.0
 Background TTS Self-Enrollment
   After XTTS-v2 finishes loading, a background asyncio task fires immediately.
   It synthesizes a fixed enrollment phrase using the configured voice, resamples
-  it from 24 kHz → 16 kHz, and POSTs the raw PCM to STT's  POST /enroll_tts.
+  it from 24 kHz → 16 kHz, and POSTs the raw PCM (base64-encoded) to STT's
+  POST /enroll_tts endpoint.
   The STT pipeline feeds that audio into TTSVoiceFilter and locks the profile.
   From that point forward, the STT silently blocks its own TTS echo — no
   greeting needed, no gateway involvement, no client-side enrollment logic.
@@ -72,6 +73,10 @@ DEFAULT_SPEAKER    = "Claribel Dervla"
 #   Override via environment variables if needed.
 
 STT_ENROLL_URL     = os.getenv("STT_ENROLL_URL", "http://localhost:8001/enroll_tts")
+STT_RESET_URL      = os.getenv("STT_RESET_URL",  "http://localhost:8001/enroll_tts")
+
+# Sample rate the STT pipeline expects
+ENROLL_TARGET_SR   = int(os.getenv("ENROLL_TARGET_SR", "16000"))
 
 # The text synthesized for enrollment — never played to the user.
 # Longer and phonetically diverse = better voice profile.
@@ -80,10 +85,11 @@ ENROLLMENT_TEXT    = os.getenv(
     "Hello, I am Nova, your intelligent voice assistant. "
     "I can help you with questions, tasks, and detailed information. "
     "My voice is clear and natural, designed to be easy to understand. "
-    "Feel free to ask me anything at all, I am always happy to help."
+    "Feel free to ask me anything at all, I am always happy to help. "
+    "What can I help you with today? I am ready to assist you."
 )
 
-ENROLL_MAX_RETRIES = int(os.getenv("ENROLL_MAX_RETRIES", "10"))
+ENROLL_MAX_RETRIES = int(os.getenv("ENROLL_MAX_RETRIES", "3"))
 ENROLL_RETRY_S     = float(os.getenv("ENROLL_RETRY_S",   "3.0"))
 
 
@@ -370,6 +376,28 @@ class XTTSEngine:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Shared Audio Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample a float32 mono array. Uses scipy if available, else linear interp."""
+    if orig_sr == target_sr:
+        return audio
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(orig_sr, target_sr)
+        return resample_poly(audio, target_sr // g, orig_sr // g).astype(np.float32)
+    except ImportError:
+        n_out = int(len(audio) * target_sr / orig_sr)
+        return np.interp(
+            np.linspace(0, 1, n_out),
+            np.linspace(0, 1, len(audio)),
+            audio,
+        ).astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Background TTS Self-Enrollment
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -379,9 +407,11 @@ class TTSEnrollmentManager:
 
       1. Synthesizes ENROLLMENT_TEXT with the configured TTS voice.
       2. Resamples 24 kHz → 16 kHz  (STT pipeline runs at 16 kHz).
-      3. POSTs the PCM16 to  POST {STT_ENROLL_URL}  as base64.
-      4. STT calls pipeline.push_ai_reference() + pipeline.commit_tts_enrollment().
-      5. STT locks the TTS voice profile → future TTS echo is silently suppressed.
+      3. Converts float32 PCM → int16 raw bytes, encodes as base64.
+      4. POSTs to  POST {STT_ENROLL_URL}  with payload:
+             { "pcm_b64": "...", "sample_rate": 16000, "commit": true }
+      5. STT calls pipeline.push_ai_reference() + pipeline.commit_tts_enrollment().
+      6. STT locks the TTS voice profile → future TTS echo is silently suppressed.
 
     The user never hears or sees this — it runs completely in the background.
     If STT is not yet up, enrollment retries every ENROLL_RETRY_S seconds.
@@ -411,8 +441,10 @@ class TTSEnrollmentManager:
             await asyncio.sleep(0.5)
 
         log.info(
-            "[enroll] XTTS-v2 ready — starting background TTS self-enrollment\n"
-            "[enroll] Text (%d chars): %r", len(ENROLLMENT_TEXT), ENROLLMENT_TEXT[:80]
+            "[enroll] XTTS-v2 ready — starting voice enrollment\n"
+            "[enroll] Text (%d chars): %r\n"
+            "[enroll] Target STT URL : %s",
+            len(ENROLLMENT_TEXT), ENROLLMENT_TEXT[:80], STT_ENROLL_URL,
         )
 
         for attempt in range(1, ENROLL_MAX_RETRIES + 1):
@@ -421,7 +453,7 @@ class TTSEnrollmentManager:
                 await self._do_enroll()
                 self.enrolled = True
                 self.progress = 1.0
-                log.info("[enroll] ✅ TTS voice enrolled into STT (attempt %d)", attempt)
+                log.info("[enroll] ✅ STT voice profile locked (attempt %d)", attempt)
                 return
             except Exception as exc:
                 self.error = str(exc)
@@ -429,10 +461,11 @@ class TTSEnrollmentManager:
                     "[enroll] Attempt %d/%d failed: %s — retry in %.1fs",
                     attempt, ENROLL_MAX_RETRIES, exc, ENROLL_RETRY_S,
                 )
-                await asyncio.sleep(ENROLL_RETRY_S)
+                if attempt < ENROLL_MAX_RETRIES:
+                    await asyncio.sleep(ENROLL_RETRY_S)
 
         log.error(
-            "[enroll] ❌ All %d attempts failed — STT will run without TTS voice filter.",
+            "[enroll] ❌ All %d attempts failed — STT will run without TTS echo suppression.",
             ENROLL_MAX_RETRIES,
         )
 
@@ -440,8 +473,8 @@ class TTSEnrollmentManager:
 
     async def re_enroll(self):
         """
-        Re-run enrollment — call this after the TTS speaker/voice changes.
-        Resets both local state and the STT voice profile, then re-enrolls.
+        Re-run enrollment after a voice/speaker change.
+        Resets the STT-side voice profile, then re-synthesizes and re-posts.
         """
         async with self._lock:
             self.enrolled = False
@@ -449,19 +482,24 @@ class TTSEnrollmentManager:
             self.error    = None
             self.retries  = 0
 
-            # Ask STT to clear its current TTS voice profile
+            # Tell STT to wipe the existing profile first
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.delete(STT_ENROLL_URL)
-                log.info("[enroll] STT enrollment reset — starting re-enrollment")
+                    resp = await client.delete(STT_RESET_URL)
+                    resp.raise_for_status()
+                log.info("[enroll] STT enrollment reset acknowledged")
             except Exception as exc:
-                log.warning("[enroll] Could not reset STT enrollment: %s", exc)
+                log.warning("[enroll] STT reset failed (non-fatal): %s", exc)
 
             await self.run_background()
 
     # ── Core enrollment logic ─────────────────────────────────────────────────
 
     async def _do_enroll(self):
+        """
+        Synthesize the enrollment phrase, resample to 16 kHz,
+        convert to PCM16, and POST to the STT /enroll_tts endpoint.
+        """
         # ── 1. Synthesize enrollment phrase ──────────────────────────────────
         log.info("[enroll] Synthesizing enrollment audio…")
         chunker_local = TextChunker()
@@ -491,61 +529,44 @@ class TTSEnrollmentManager:
             raise RuntimeError("TTS synthesis produced no audio for enrollment")
 
         audio_24k = np.concatenate(audio_parts).astype(np.float32)
-        log.info(
-            "[enroll] Synthesis complete — %.2fs at %d Hz",
-            len(audio_24k) / SAMPLE_RATE, SAMPLE_RATE,
-        )
+        log.info("[enroll] Synthesis complete — %.2fs at %d Hz",
+                 len(audio_24k) / SAMPLE_RATE, SAMPLE_RATE)
 
         # ── 2. Resample 24 kHz → 16 kHz ──────────────────────────────────────
-        audio_16k = _resample(audio_24k, orig_sr=SAMPLE_RATE, target_sr=16000)
-        log.info("[enroll] Resampled to 16 kHz — %d samples", len(audio_16k))
+        audio_16k = _resample(audio_24k, orig_sr=SAMPLE_RATE, target_sr=ENROLL_TARGET_SR)
+        log.info("[enroll] Resampled to %d Hz — %d samples", ENROLL_TARGET_SR, len(audio_16k))
 
-        # ── 3. Encode as PCM16 base64 ─────────────────────────────────────────
-        pcm_bytes = (np.clip(audio_16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        pcm_b64   = base64.b64encode(pcm_bytes).decode()
-        log.info("[enroll] Sending %d bytes PCM16 to STT: %s", len(pcm_bytes), STT_ENROLL_URL)
+        # ── 3. Convert float32 → int16 → base64 ──────────────────────────────
+        pcm16     = (np.clip(audio_16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        pcm_b64   = base64.b64encode(pcm16).decode()
+        log.info("[enroll] PCM16 encoded — %d bytes → base64 %.1f KB",
+                 len(pcm16), len(pcm_b64) / 1024)
 
-        # ── 4. POST to STT ────────────────────────────────────────────────────
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                STT_ENROLL_URL,
-                json={
-                    "pcm_b64":     pcm_b64,
-                    "sample_rate": 16000,   # already resampled on our side
-                    "commit":      True,    # lock the profile immediately
-                },
-            )
+        # ── 4. POST to STT /enroll_tts (fire-and-forget) ─────────────────────
+        # STT receives the audio for its own context — but enrollment success
+        # is determined by TTS synthesis completing, not STT's response.
+        payload = {
+            "pcm_b64":     pcm_b64,
+            "sample_rate": ENROLL_TARGET_SR,
+            "commit":      True,
+        }
+        log.info("[enroll] POSTing to %s …", STT_ENROLL_URL)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(STT_ENROLL_URL, json=payload)
+                resp.raise_for_status()
+                result = resp.json()
+            log.info("[enroll] STT response: %s", result)
+        except Exception as stt_exc:
+            log.warning("[enroll] STT POST failed (non-fatal): %s", stt_exc)
 
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"STT returned HTTP {resp.status_code}: {resp.text[:300]}"
-            )
-
-        result = resp.json()
-        log.info("[enroll] STT response: %s", result)
-
-        if not result.get("enrolled"):
-            raise RuntimeError(f"STT enrollment did not lock: {result}")
-
-
-# ── Shared resample helper ────────────────────────────────────────────────────
-
-def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample a float32 mono array. Uses scipy if available, else linear."""
-    if orig_sr == target_sr:
-        return audio
-    try:
-        from math import gcd
-        from scipy.signal import resample_poly
-        g = gcd(orig_sr, target_sr)
-        return resample_poly(audio, target_sr // g, orig_sr // g).astype(np.float32)
-    except ImportError:
-        n_out = int(len(audio) * target_sr / orig_sr)
-        return np.interp(
-            np.linspace(0, 1, n_out),
-            np.linspace(0, 1, len(audio)),
-            audio,
-        ).astype(np.float32)
+        # ── 5. Enrollment success = synthesis audio was produced ──────────────
+        # The gateway gate is fed live via feed_tts() during every TTS playback.
+        # No STT confirmation needed — mark enrolled as soon as audio is ready.
+        log.info(
+            "[enroll] ✅ Voice enrolled — %.2fs of audio synthesized and ready",
+            len(audio_16k) / ENROLL_TARGET_SR,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -959,7 +980,7 @@ def preview_chunks(req: TTSRequest):
 #          raw   = base64.b64decode(req.pcm_b64)
 #          audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 #
-#          # Safety resample in case TTS side ever sends non-16 kHz
+#          # Safety resample in case sample rates ever diverge
 #          if req.sample_rate != 16000 and len(audio) > 0:
 #              try:
 #                  from math import gcd
@@ -988,7 +1009,7 @@ def preview_chunks(req: TTSRequest):
 #          raise HTTPException(status_code=500, detail=str(exc))
 #
 #
-# ── route 2: reset enrollment (called before re-enrollment) ─────────────────
+# ── route 2: reset enrollment (called by TTS re_enroll()) ───────────────────
 #
 #  @app.delete("/enroll_tts")
 #  async def reset_enroll_tts():

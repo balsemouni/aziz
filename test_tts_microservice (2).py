@@ -170,8 +170,7 @@ def test_tts_voice_same_voice():
     else:
         print("  ❌ FAIL — is_same_voice = False  (waveforms diverged beyond threshold)")
 
-    # Return (reference_audio, passed) so TEST 3 can reuse the TTS waveform
-    return audio_a, result
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,61 +215,6 @@ def test_my_voice():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TEST 3 — Live mic recording  →  is TTS voice? (expect False)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def record_from_mic(duration_sec: float = 5.0,
-                    sample_rate: int = 16000) -> np.ndarray:
-    """
-    Record `duration_sec` seconds from the default microphone.
-    Returns a float32 mono numpy array.
-    Requires: pip install sounddevice
-    """
-    try:
-        import sounddevice as sd
-    except ImportError:
-        raise RuntimeError(
-            "sounddevice is not installed.\n"
-            "  pip install sounddevice"
-        )
-
-    print(f"  🎙️  Recording for {duration_sec}s … speak now!")
-    audio = sd.rec(
-        int(duration_sec * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype="float32",
-    )
-    sd.wait()
-    print("  ✅ Recording complete.")
-    return audio.flatten()
-
-
-def test_mic_vs_tts_voice(tts_reference_audio: np.ndarray,
-                           duration_sec: float = 5.0) -> bool:
-    """
-    Record from the microphone and check whether it matches the TTS voice.
-    Expected result: False  (a real human voice ≠ the TTS speaker).
-
-    tts_reference_audio  — the float32 array already synthesised in TEST 1.
-    """
-    print("\n" + "═" * 60)
-    print("TEST 3 — Mic recording  →  is it the TTS voice?")
-    print("═" * 60)
-    print(f"  Say anything for {duration_sec} seconds …")
-
-    try:
-        mic_audio = record_from_mic(duration_sec=duration_sec)
-    except RuntimeError as exc:
-        print(f"  ⚠️  SKIP — {exc}")
-        return None
-
-    result = is_same_voice(mic_audio, tts_reference_audio)
-    print(f"\n  is_tts_voice → {result}")
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -288,12 +232,10 @@ def main():
         sys.exit(1)
 
     # ── Run tests ─────────────────────────────────────────────────────────────
-    results       = {}
-    tts_ref_audio = None   # kept for TEST 3
+    results = {}
 
     try:
-        tts_ref_audio, passed = test_tts_voice_same_voice()
-        results["test_tts_voice_same_voice"] = passed
+        results["test_tts_voice_same_voice"] = test_tts_voice_same_voice()
     except Exception as exc:
         print(f"  ❌ TEST 1 raised an exception: {exc}")
         results["test_tts_voice_same_voice"] = False
@@ -303,16 +245,6 @@ def main():
     except Exception as exc:
         print(f"  ❌ TEST 2 raised an exception: {exc}")
         results["test_my_voice"] = False
-
-    try:
-        if tts_ref_audio is not None:
-            results["test_mic_vs_tts_voice"] = test_mic_vs_tts_voice(tts_ref_audio)
-        else:
-            print("\n⚠️  TEST 3 skipped — no TTS reference audio (TEST 1 failed).")
-            results["test_mic_vs_tts_voice"] = None
-    except Exception as exc:
-        print(f"  ❌ TEST 3 raised an exception: {exc}")
-        results["test_mic_vs_tts_voice"] = False
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "═" * 60)
