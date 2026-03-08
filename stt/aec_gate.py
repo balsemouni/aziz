@@ -1,37 +1,31 @@
 """
-aec_gate.py
-───────────
+aec_gate.py  v2.0
+─────────────────
 Software-level Acoustic Echo Cancellation Gate
 
-Problem
-───────
-When the AI (TTS) is playing audio through the speakers, that audio leaks back
-into the microphone.  The browser's built-in AEC (echoCancellation: true) handles
-most of this, but residual echo still arrives at the STT microservice — especially
-on loudspeaker setups.
+FIXES vs v1
+───────────
+  Fix 1 — Extended POST_STOP_BUFFER_MS (300 → 1200 ms)
+      TTS echo rings in the mic for much longer than 300 ms, especially
+      on speakers. Raising the tail to 1200 ms eliminates the "STT catches
+      the last word of TTS" problem without hurting real barge-in (which is
+      handled by identity, not timing).
 
-Solution: a two-layer gate implemented entirely in Python/numpy
-  Layer A — State Gate
-      The orchestrator signals the STT service when the AI is speaking via the
-      WebSocket control message { "type": "ai_state", "speaking": true }.
-      While speaking=true + grace period, the VAD threshold is raised and chunks
-      are suppressed unless they exceed an energy ratio vs the reference signal.
+  Fix 2 — Full suppression while AI speaking (no reference needed)
+      Old code required a reference signal to suppress during the grace period.
+      Without reference it still let audio through after GRACE_PERIOD_MS.
+      New code: while ai_speaking=True → ALWAYS suppress regardless of reference.
+      Reference is now ONLY used for the optional spectral-subtraction cleanup
+      on non-suppressed chunks (outside the gate window).
 
-  Layer B — Spectral Subtraction (Reference-Based)
-      When a reference signal (what the AI is actually playing) is available,
-      we subtract its spectral envelope from the incoming mic audio.
-      This is a simplified Wiener-filter approach — works well for TTS which has
-      a very predictable spectral shape.
+  Fix 3 — Barge-in gate removed from AEC
+      Barge-in is now detected purely by TTSVoiceFilter identity check in
+      pipeline.py.  AEC no longer tries to "allow loud barge-ins" based on
+      energy ratio — that was unreliable and caused echo leakage.
+      The AEC gate now has one job: suppress while AI is speaking + tail.
 
-The reference signal is OPTIONAL.  If the frontend sends AI audio back to the
-STT service over a separate WebSocket channel, we use it.  If not, Layer A alone
-is used (state gate only).
-
-Integration points
-──────────────────
-  • pipeline.py  →  aec_gate.process(chunk, ai_speaking) before VAD
-  • main.py      →  receives { type: "ai_state", speaking: bool } control frames
-                    receives { type: "ai_reference", pcm: <bytes> } audio frames
+  Fix 4 — reset() clears speaking state
+      If the session resets mid-utterance the gate no longer stays open.
 """
 
 from __future__ import annotations
@@ -55,31 +49,28 @@ logger = logging.getLogger(__name__)
 #  Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-GRACE_PERIOD_MS      = 800    # Block ASR for this long after AI starts speaking
-POST_STOP_BUFFER_MS  = 300    # Continue blocking after AI stops (echo tail)
-SPECTRAL_ALPHA       = 0.85   # Spectral subtraction strength (0=none, 1=full)
-REFERENCE_QUEUE_MS   = 2000   # How much reference audio to keep in buffer
+GRACE_PERIOD_MS      = 200    # Short grace before first AI word reaches mic
+POST_STOP_BUFFER_MS  = 1200   # FIX: was 300 — cover full echo tail after TTS stops
+SPECTRAL_ALPHA       = 0.85   # Spectral subtraction strength (outside gate window)
+REFERENCE_QUEUE_MS   = 3000   # How much reference audio to keep
 
 
 class AECGate:
     """
     Acoustic Echo Cancellation Gate.
 
-    Usage
-    ─────
-        aec = AECGate(sample_rate=16000)
+    Two modes depending on whether a reference signal is available:
 
-        # When TTS starts/stops:
-        aec.set_ai_speaking(True)
-        aec.set_ai_speaking(False)
+      WITHOUT reference  (most deployments):
+        • While AI speaking + POST_STOP_BUFFER_MS tail → SUPPRESS everything.
+        • Outside that window → PASS through unchanged.
 
-        # Optional: feed reference (what AI is playing)
-        aec.push_reference(pcm_chunk)
+      WITH reference (TTS forwards PCM back):
+        • Same suppression window.
+        • Outside window → light spectral subtraction for residual cleanup.
 
-        # In your chunk loop — call BEFORE VAD:
-        cleaned, suppressed = aec.process(mic_chunk)
-        if not suppressed:
-            # forward cleaned audio to VAD / ASR
+    Barge-in is NOT handled here.  Identity-based barge-in lives in
+    pipeline.py / TTSVoiceFilter.  This gate's only job is echo suppression.
     """
 
     def __init__(self, sample_rate: int = 16000):
@@ -88,21 +79,16 @@ class AECGate:
         self._ai_started_at: Optional[float]  = None
         self._ai_stopped_at: Optional[float]  = None
 
-        # Reference signal buffer (circular)
         _ref_samples = int(sample_rate * REFERENCE_QUEUE_MS / 1000)
-        self._reference_buffer: deque[np.ndarray] = deque(maxlen=_ref_samples)
+        self._reference_buffer: deque = deque(maxlen=_ref_samples)
         self._has_reference = False
 
-        # Stats
         self.chunks_suppressed = 0
         self.chunks_processed  = 0
 
     # ── AI state control ─────────────────────────────────────────────────────
 
     def set_ai_speaking(self, speaking: bool):
-        """
-        Called by main.py when it receives a control message from the orchestrator.
-        """
         if speaking and not self._ai_speaking:
             self._ai_speaking   = True
             self._ai_started_at = time.monotonic()
@@ -112,16 +98,11 @@ class AECGate:
         elif not speaking and self._ai_speaking:
             self._ai_speaking   = False
             self._ai_stopped_at = time.monotonic()
-            logger.debug("[AEC] AI stopped — draining echo tail")
+            logger.debug(f"[AEC] AI stopped — echo tail {POST_STOP_BUFFER_MS}ms")
 
     # ── Reference signal ─────────────────────────────────────────────────────
 
     def push_reference(self, pcm_chunk: np.ndarray):
-        """
-        Optionally feed what the AI is playing.
-        Call this from the TTS audio playback path (frontend forwards it back,
-        or the TTS microservice pushes it via an internal Redis channel).
-        """
         self._reference_buffer.extend(pcm_chunk.astype(np.float32).tolist())
         self._has_reference = True
 
@@ -130,63 +111,34 @@ class AECGate:
     def process(
         self,
         mic_chunk: np.ndarray,
-        force_check: bool = False,
     ) -> tuple[np.ndarray, bool]:
         """
-        Process one mic chunk through the AEC gate.
+        Process one mic chunk.
 
-        Returns
-        ───────
-        (cleaned_audio, suppressed)
-          cleaned_audio : np.ndarray  — mic audio after spectral subtraction
-          suppressed    : bool        — True = do NOT forward to VAD/ASR
+        Returns (cleaned_audio, suppressed).
+        If suppressed=True do NOT forward to VAD/ASR.
         """
         self.chunks_processed += 1
         cleaned = mic_chunk.astype(np.float32)
 
-        # ── Layer A: State gate ───────────────────────────────────────────
-        in_grace    = self._in_grace_period()
-        in_tail     = self._in_echo_tail()
-
-        if in_grace or in_tail:
-            # Apply spectral subtraction if we have a reference, then still
-            # suppress unless the user is speaking MUCH louder than the echo
+        # ── Gate: suppress while AI is speaking + echo tail ───────────────
+        # FIX: full suppression, no energy-ratio barge-in bypass.
+        # Barge-in is handled by TTSVoiceFilter identity check.
+        if self._ai_speaking or self._in_echo_tail():
+            # Optional: spectral subtract to clean audio for downstream
+            # (useful if caller still wants the cleaned signal for logging)
             if self._has_reference:
                 cleaned = self._spectral_subtract(cleaned)
+            self.chunks_suppressed += 1
+            return cleaned, True   # SUPPRESSED
 
-            # Energy ratio check — allow through if user is WAY louder than ref
-            if self._has_reference:
-                ref_rms = self._reference_rms()
-                mic_rms = float(np.sqrt(np.mean(cleaned**2) + 1e-9))
-                # Only allow if mic is 3× louder than reference (clear barge-in)
-                if mic_rms < ref_rms * 3.0:
-                    self.chunks_suppressed += 1
-                    return cleaned, True   # SUPPRESSED
-                else:
-                    logger.debug(
-                        f"[AEC] Barge-in energy ratio {mic_rms/ref_rms:.1f}× — ALLOWING"
-                    )
-                    return cleaned, False  # ALLOWED (user is shouting over AI)
-            else:
-                # No reference → full state-gate suppression
-                self.chunks_suppressed += 1
-                return cleaned, True
-
-        # ── Layer B: Spectral subtraction when NOT suppressed ─────────────
-        # (Clean up any residual echo even outside grace period)
+        # ── Outside gate window: light cleanup only ────────────────────────
         if self._has_reference:
-            cleaned = self._spectral_subtract(cleaned, strength=0.3)
+            cleaned = self._spectral_subtract(cleaned, strength=0.25)
 
         return cleaned, False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
-
-    def _in_grace_period(self) -> bool:
-        """True for GRACE_PERIOD_MS after AI starts speaking."""
-        if not self._ai_speaking or self._ai_started_at is None:
-            return False
-        elapsed_ms = (time.monotonic() - self._ai_started_at) * 1000
-        return elapsed_ms < GRACE_PERIOD_MS
 
     def _in_echo_tail(self) -> bool:
         """True for POST_STOP_BUFFER_MS after AI stops speaking."""
@@ -195,76 +147,54 @@ class AECGate:
         elapsed_ms = (time.monotonic() - self._ai_stopped_at) * 1000
         return elapsed_ms < POST_STOP_BUFFER_MS
 
-    def _reference_rms(self) -> float:
-        if not self._reference_buffer:
-            return 0.0
-        arr = np.array(list(self._reference_buffer)[-2048:], dtype=np.float32)
-        return float(np.sqrt(np.mean(arr**2) + 1e-9))
-
     def _spectral_subtract(
         self,
         audio: np.ndarray,
         strength: float = SPECTRAL_ALPHA,
     ) -> np.ndarray:
-        """
-        Simplified spectral subtraction using the reference buffer.
-        Uses torch.fft (CUDA) when available for ~3× faster processing,
-        falling back to numpy.fft on CPU. Audio stays float32 throughout
-        (zero extra copies).
-        """
         if not self._reference_buffer:
             return audio
 
         n = len(audio)
         ref_arr = np.array(list(self._reference_buffer)[-n:], dtype=np.float32)
-
-        # Zero-pad reference if shorter
         if len(ref_arr) < n:
             ref_arr = np.pad(ref_arr, (0, n - len(ref_arr)))
 
-        # ── Fast path: torch.fft on CUDA ────────────────────────────────
         if _TORCH_AVAILABLE and _torch.cuda.is_available():
             mic_t = _torch.from_numpy(audio).cuda()
             ref_t = _torch.from_numpy(ref_arr[:n]).cuda()
-
-            mic_fft   = _torch.fft.rfft(mic_t)
-            ref_fft   = _torch.fft.rfft(ref_t)
-
-            mic_mag   = mic_fft.abs()
-            ref_mag   = ref_fft.abs()
-            mic_phase = _torch.angle(mic_fft)
-
-            sub_mag   = _torch.clamp(mic_mag - strength * ref_mag, min=0.0)
+            mic_fft    = _torch.fft.rfft(mic_t)
+            ref_fft    = _torch.fft.rfft(ref_t)
+            mic_mag    = mic_fft.abs()
+            ref_mag    = ref_fft.abs()
+            mic_phase  = _torch.angle(mic_fft)
+            sub_mag    = _torch.clamp(mic_mag - strength * ref_mag, min=0.0)
             result_fft = sub_mag * _torch.exp(1j * mic_phase)
-
             return _torch.fft.irfft(result_fft, n=n).cpu().numpy().astype(np.float32)
 
-        # ── Fallback: numpy FFT on CPU ───────────────────────────────────
         mic_fft = np.fft.rfft(audio)
         ref_fft = np.fft.rfft(ref_arr[:n])
-
         mic_mag  = np.abs(mic_fft)
         ref_mag  = np.abs(ref_fft)
         mic_phase = np.angle(mic_fft)
-
-        subtracted_mag = np.maximum(mic_mag - strength * ref_mag, 0.0)
-        result_fft = subtracted_mag * np.exp(1j * mic_phase)
-
+        sub_mag = np.maximum(mic_mag - strength * ref_mag, 0.0)
+        result_fft = sub_mag * np.exp(1j * mic_phase)
         return np.fft.irfft(result_fft, n=n).astype(np.float32)
 
     def get_stats(self) -> dict:
         return {
             "ai_speaking":        self._ai_speaking,
+            "in_echo_tail":       self._in_echo_tail(),
             "has_reference":      self._has_reference,
             "chunks_processed":   self.chunks_processed,
             "chunks_suppressed":  self.chunks_suppressed,
-            "suppression_rate":   (
-                round(self.chunks_suppressed / max(self.chunks_processed, 1), 3)
+            "suppression_rate":   round(
+                self.chunks_suppressed / max(self.chunks_processed, 1), 3
             ),
+            "post_stop_buffer_ms": POST_STOP_BUFFER_MS,
         }
 
     def reset(self):
-        """Reset for a new session."""
         self._ai_speaking    = False
         self._ai_started_at  = None
         self._ai_stopped_at  = None

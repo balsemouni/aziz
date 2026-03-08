@@ -1,34 +1,45 @@
 """
-pipeline.py — STT Pipeline  v2.0
-───────────────────────────────────────────
-Flow per chunk:
-  1. AEC        — suppress echo while AI is playing audio
-  2. VAD        — Silero voice probability + silence detection
-  3. Enrollment — build/check speaker profile (optional)
-  4. ASR buffer — accumulate voice audio until FIRE_MS, then call Whisper
-  5. Flush      — on silence_event: drain buffer + flush ASR with beam=5
+pipeline.py — STT Pipeline  v5.2  (AEC + TTSVoiceGate + Barge-In)
+──────────────────────────────────────────────────────────────────
 
-Key rules (unchanged from v1 — core logic preserved):
-  - Audio is buffered during voice activity until ASR_MIN_SAMPLES (600ms)
-    is reached, then forwarded to Whisper (live greedy pass).
-  - On silence_event the buffer is drained immediately and ASR.flush()
-    is called with beam=5 to catch any words missed by live passes.
-  - ASR runs ONLY when is_voice=True.
-  - Flush fires ONLY on silence_event (first silent chunk after voice ends).
-  - Enrollment runs in parallel.
+CHANGES vs v5.1
+───────────────
+  Added — TTSVoiceGate (acoustic fingerprint-based AI voice suppressor):
 
-CHANGES in v2.0 (accuracy fixes):
-  - pipeline no longer manages its own ASR buffer.
-    RealTimeChunkASR v2 accumulates chunks internally, so pipeline simply
-    calls transcribe_chunk() for every voice chunk and flush() on silence.
-    This removes the double-buffer coordination bug that caused word loss
-    on short sentences: the old code could drain the pipeline buffer into
-    ASR, call flush(), but ASR's own state had already advanced past those
-    words — resulting in the tail being silently dropped.
+    The TTS microservice enrolls its own voice at startup by POSTing PCM
+    to  POST /enroll_tts  in main.py.  That audio is forwarded to the
+    pipeline via  push_ai_reference().
 
-  - The silence_event flush now calls asr.flush() unconditionally
-    (even if no words came from live passes), guaranteeing the beam=5
-    accurate pass runs at every sentence end.
+    NEW: every push_ai_reference() call ALSO feeds TTSVoiceGate.enroll(),
+    building a rolling log-mel centroid of the AI voice.
+
+    Processing order per mic chunk:
+
+      1. AECGate       — timing-based suppression (ai_speaking + 1200ms tail)
+      2. TTSVoiceGate  — acoustic-fingerprint suppression (cosine similarity)
+      3. VAD           — voice activity detection
+      4. Barge-in      — fire barge_in event if human voice detected
+      5. ASR           — Whisper transcription
+
+    TTSVoiceGate catches echo that slips past the AEC timing window:
+      • Reverberant rooms where echo rings > 1200 ms
+      • Edge cases where ai_state=False arrives late from gateway
+      • The last word of a long TTS sentence (echo tail race)
+
+    Barge-in safety: TTSVoiceGate uses a HIGHER similarity threshold while
+    ai_speaking=True, so real human speech overlapping with echo is not
+    suppressed.
+
+Flow per chunk
+──────────────
+  1. AECGate       — if ai_speaking AND NOT barge_in_active → suppress
+                     if ai_speaking AND barge_in_active     → pass through
+  2. TTSVoiceGate  — if enrolled AND sim >= threshold → suppress
+                     (skipped if already suppressed by AECGate)
+  3. VAD           — always runs on cleaned signal
+  4. Barge-in      — if ai_speaking and prob > barge_in_threshold → emit
+  5. ASR           — accumulate voice, fire Whisper
+  6. Flush         — on silence_event → drain + segment
 """
 
 from __future__ import annotations
@@ -44,7 +55,7 @@ for _c in [_HERE, os.path.join(_HERE, ".."), os.path.join(_HERE, "agent")]:
 from vad import VoiceActivityDetector
 from realtime_asr import RealTimeChunkASR
 from aec_gate import AECGate
-from speaker_enrollment import SpeakerEnrollmentService
+from tts_voice_gate import TTSVoiceGate
 
 logger = logging.getLogger(__name__)
 
@@ -53,61 +64,73 @@ class STTPipeline:
 
     def __init__(
         self,
-        sample_rate: int             = 16000,
-        device: str | None           = None,
+        sample_rate: int              = 16000,
+        device: str | None            = None,
         # VAD
-        idle_threshold: float        = 0.15,
-        barge_in_threshold: float    = 0.40,
-        vad_pre_gain: float          = 5.0,
+        idle_threshold: float         = 0.15,
+        barge_in_threshold: float     = 0.40,
+        vad_pre_gain: float           = 5.0,
         # ASR
-        whisper_model_size: str      = "base.en",
-        overlap_seconds: float       = 0.8,
-        word_gap_ms: float           = 80.0,
-        max_context_words: int       = 10,
-        max_history_turns: int       = 3,
-        # asr_min_buffer_ms: kept for API compat — RealTimeChunkASR v2 handles
-        # its own accumulation internally (FIRE_MS constant = 600ms default).
-        asr_min_buffer_ms: float     = 600.0,
-        # AEC
-        enable_aec: bool             = True,
-        # Enrollment
-        enable_enrollment: bool      = True,
-        similarity_threshold: float  = 0.65,   # v6: loosened for first-chunk anchor
+        whisper_model_size: str       = "base.en",
+        overlap_seconds: float        = 0.8,
+        word_gap_ms: float            = 80.0,
+        max_context_words: int        = 10,
+        max_history_turns: int        = 3,
+        asr_min_buffer_ms: float      = 600.0,
+        # AEC (timing-based gate)
+        enable_aec: bool              = True,
+        # TTSVoiceGate (acoustic fingerprint gate)
+        enable_voice_gate: bool       = True,
+        voice_gate_threshold: float   = 0.70,   # suppress when sim >= this
+        voice_gate_barge_in: float    = 0.82,   # stricter threshold during barge-in
+        voice_gate_min_frames: int    = 8,      # min enrolled frames before gate activates
+        # Barge-in tuning
+        barge_in_debounce_frames: int = 2,
+        barge_in_cooldown_ms: float   = 1500.0,
         # Compat params (ignored)
-        ai_detector_model_path=None,
-        ai_detection_threshold=0.7,
-        enable_ai_filtering=False,
-        barge_in_debounce_frames=2,
-        barge_in_energy_ratio=2.5,
-        barge_in_cooldown_ms=1500.0,
-        speculative_vad_threshold=0.08,
+        enable_tts_filter: bool       = False,
+        tts_sim_threshold: float      = 0.75,
+        tts_n_enroll_samples: int     = 3,
+        tts_min_enroll_seconds: float = 0.25,
+        barge_in_min_words: int       = 1,
+        enable_enrollment: bool       = False,
+        similarity_threshold: float   = 0.82,
+        n_enroll_samples: int         = 1,
+        min_enroll_seconds: float     = 0.30,
+        ai_detector_model_path        = None,
+        ai_detection_threshold        = 0.7,
+        enable_ai_filtering           = False,
+        barge_in_energy_ratio         = 2.5,
+        speculative_vad_threshold     = 0.08,
     ):
         import torch
         _device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.sample_rate  = sample_rate
-        self._ai_speaking = False
-        self._last_is_voice = False
+        self.sample_rate           = sample_rate
+        self.barge_in_threshold    = barge_in_threshold
+        self.barge_in_debounce     = barge_in_debounce_frames
+        self.barge_in_cooldown_ms  = barge_in_cooldown_ms
+
+        # State
+        self._ai_speaking          = False
+        self._last_is_voice        = False
         self._words_this_utterance: List[str] = []
 
-        # ── Enrollment audio replay buffer ────────────────────────────────────
-        # Accumulates voice chunks DURING enrollment so they can be replayed
-        # into ASR the moment the profile locks.  Without this, all speech
-        # spoken while the voice print was being built is lost to ASR.
-        self._pre_enroll_buffer: List[np.ndarray] = []
-        self._was_enrolled: bool = False          # tracks enrollment state transitions
+        # Barge-in state
+        self._barge_in_active      = False
+        self._barge_in_fired_ts    = 0.0
+        self._barge_in_voice_frames = 0
 
-        # ── Latency tracking ──────────────────────────────────────────────
-        # Measures: time from first voice chunk → segment event fires
-        self._utterance_start_ts: Optional[float] = None   # monotonic, set on first voice chunk
-        self._latency_history: List[float] = []            # ms, one entry per segment
+        # Latency tracking
+        self._utterance_start_ts: Optional[float] = None
+        self._latency_history: List[float] = []
 
         self.vad = VoiceActivityDetector(
-            sample_rate            = sample_rate,
-            device                 = _device,
-            idle_threshold         = idle_threshold,
-            barge_in_threshold     = barge_in_threshold,
-            pre_gain               = vad_pre_gain,
+            sample_rate        = sample_rate,
+            device             = _device,
+            idle_threshold     = idle_threshold,
+            barge_in_threshold = barge_in_threshold,
+            pre_gain           = vad_pre_gain,
         )
 
         self.realtime_asr = RealTimeChunkASR(
@@ -120,49 +143,143 @@ class STTPipeline:
             max_history_turns = max_history_turns,
         )
 
+        # ── Gate 1: AEC timing gate ───────────────────────────────────────────
         self.aec = AECGate(sample_rate=sample_rate) if enable_aec else None
 
-        self.enrollment = (
-            SpeakerEnrollmentService(
-                sample_rate          = sample_rate,
-                similarity_threshold = similarity_threshold,
-                # v6: no enroll_min_seconds — profile locks on first voice chunk
-            )
-            if enable_enrollment else None
-        )
+        # ── Gate 2: Acoustic fingerprint voice gate ───────────────────────────
+        self.voice_gate = TTSVoiceGate(
+            sample_rate         = sample_rate,
+            detection_threshold = voice_gate_threshold,
+            barge_in_threshold  = voice_gate_barge_in,
+            min_enroll_frames   = voice_gate_min_frames,
+            enabled             = enable_voice_gate,
+        ) if enable_voice_gate else None
 
-    # ── AI state ─────────────────────────────────────────────────────────────
+        self.tts_filter = None
+        self.enrollment = None
+
+        if enable_voice_gate:
+            logger.info(
+                f"[pipeline] TTSVoiceGate enabled  "
+                f"thresh={voice_gate_threshold}  barge_thresh={voice_gate_barge_in}"
+            )
+
+    # ── AI / TTS state ────────────────────────────────────────────────────────
 
     def notify_ai_speaking(self, speaking: bool):
+        """
+        Call when TTS starts (True) or stops (False).
+        Resets barge-in state on every AI turn boundary.
+        """
         self._ai_speaking = speaking
         if self.aec:
             self.aec.set_ai_speaking(speaking)
 
+        if not speaking:
+            self._barge_in_active       = False
+            self._barge_in_voice_frames = 0
+            logger.debug("[pipeline] AI stopped — barge-in reset")
+
     def push_ai_reference(self, pcm: np.ndarray):
+        """
+        Feed TTS output PCM to both gates:
+          • AECGate      — spectral subtraction reference
+          • TTSVoiceGate — builds acoustic fingerprint of AI voice
+        """
         if self.aec:
             self.aec.push_reference(pcm)
+
+        # NEW: enroll every TTS frame so the voice gate learns the AI voice
+        # continuously throughout the session (handles voice drift / speaker changes)
+        if self.voice_gate:
+            self.voice_gate.enroll(pcm)
 
     def add_assistant_turn(self, text: str):
         self.realtime_asr.add_assistant_turn(text)
 
-    # ── Main ─────────────────────────────────────────────────────────────────
+    # ── Main processing ───────────────────────────────────────────────────────
 
     def process_chunk(self, audio_chunk: np.ndarray) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
 
-        # ── Step 1: AEC ───────────────────────────────────────────────────
+        # ── Step 1: AEC timing gate ────────────────────────────────────────
+        # Suppress while AI is speaking + 1200ms echo tail.
+        # If barge-in is already confirmed, pass through for transcription.
         if self.aec:
-            cleaned, suppressed = self.aec.process(audio_chunk)
-            if suppressed:
-                return [{"type": "aec", "suppressed": True}]
+            cleaned, aec_suppressed = self.aec.process(audio_chunk)
         else:
-            cleaned = audio_chunk
+            cleaned, aec_suppressed = audio_chunk, False
 
-        # ── Step 2: VAD ───────────────────────────────────────────────────
+        # ── Step 2: TTSVoiceGate acoustic fingerprint check ───────────────
+        # Only run if the AEC didn't already suppress AND the gate is enrolled.
+        # Catches echo that slips past the timing window.
+        voice_gate_suppressed = False
+        voice_sim             = 0.0
+
+        if not aec_suppressed and self.voice_gate and self.voice_gate.is_ready:
+            # Use stricter threshold during barge-in to protect real speech
+            voice_gate_suppressed, voice_sim = self.voice_gate.check(
+                cleaned, ai_speaking=self._ai_speaking
+            )
+            if voice_gate_suppressed and not self._barge_in_active:
+                logger.debug(
+                    f"[pipeline] VoiceGate SUPPRESS  sim={voice_sim:.3f}  "
+                    f"ai_speaking={self._ai_speaking}"
+                )
+                return events   # Silent drop — nothing goes to VAD or ASR
+
+        # Overall suppressed flag (for barge-in check below)
+        suppressed = aec_suppressed or voice_gate_suppressed
+
+        # ── Step 3: VAD — always runs on cleaned signal ────────────────────
+        # VAD runs even during AEC suppression to detect barge-in.
+        # But if voice gate suppressed it (echo after timing window), skip VAD
+        # to avoid false voice detections on residual echo.
+        if voice_gate_suppressed:
+            return events
+
         audio, is_voice, prob, rms, silence_event = self.vad.process_chunk(
             cleaned, ai_is_speaking=self._ai_speaking
         )
 
+        # ── Step 4: Barge-in detection ─────────────────────────────────────
+        if self._ai_speaking:
+            if is_voice:
+                self._barge_in_voice_frames += 1
+            else:
+                self._barge_in_voice_frames = 0
+
+            now         = time.monotonic()
+            cooldown_ok = (now - self._barge_in_fired_ts) * 1000 > self.barge_in_cooldown_ms
+            debounce_ok = self._barge_in_voice_frames >= self.barge_in_debounce
+            threshold_ok = prob >= self.barge_in_threshold
+
+            if threshold_ok and debounce_ok and cooldown_ok and not self._barge_in_active:
+                self._barge_in_active    = True
+                self._barge_in_fired_ts  = now
+                self._utterance_start_ts = now
+                self._words_this_utterance.clear()
+                self.realtime_asr.flush()
+                logger.info(
+                    f"[pipeline] ⚡ BARGE-IN fired  "
+                    f"prob={prob:.3f}  frames={self._barge_in_voice_frames}  "
+                    f"voice_sim={voice_sim:.3f}"
+                )
+                events.append({
+                    "type":         "barge_in",
+                    "prob":         round(prob, 3),
+                    "voice_sim":    round(voice_sim, 3),
+                    "words_so_far": len(self._words_this_utterance),
+                })
+
+            if not self._barge_in_active:
+                return events
+
+        # ── If suppressed by AEC and no barge-in yet → skip ASR ───────────
+        if suppressed and not self._barge_in_active:
+            return events
+
+        # ── VAD state change event ─────────────────────────────────────────
         if is_voice != self._last_is_voice:
             events.append({
                 "type":     "vad",
@@ -172,64 +289,11 @@ class STTPipeline:
             })
             self._last_is_voice = is_voice
 
-        # ── Step 3: Enrollment ────────────────────────────────────────────
-        block_asr = False
-        if self.enrollment:
-            # Accumulate voice chunks into replay buffer BEFORE evaluating,
-            # so we always have the audio available if the profile locks this chunk.
-            if is_voice and not self._was_enrolled:
-                self._pre_enroll_buffer.append(audio.copy())
-
-            decision = self.enrollment.evaluate(
-                audio, is_voice=is_voice, silence_event=silence_event, vad_prob=prob
-            )
-            events.append({"type": "enrollment", **decision.to_dict()})
-
-            # ── Detect the lock transition ────────────────────────────────
-            # is_enrolled just flipped True → replay all buffered voice audio
-            # into ASR so speech spoken during enrollment is not lost.
-            just_locked = decision.enrolled and not self._was_enrolled
-            if just_locked:
-                self._was_enrolled = True
-                logger.info(
-                    f"[pipeline] Voice profile locked — replaying "
-                    f"{len(self._pre_enroll_buffer)} pre-enroll chunks into ASR"
-                )
-                if self._utterance_start_ts is None and self._pre_enroll_buffer:
-                    self._utterance_start_ts = time.monotonic()
-                for buffered_chunk in self._pre_enroll_buffer:
-                    replay_result = self.realtime_asr.transcribe_chunk(buffered_chunk)
-                    for word in replay_result.get("words", []):
-                        w = word if isinstance(word, str) else word.get("word", "")
-                        w = w.strip().strip(".,!?;:")
-                        if w and any(c.isalpha() for c in w):
-                            self._words_this_utterance.append(w)
-                            events.append({"type": "word", "word": w})
-                self._pre_enroll_buffer.clear()
-                events.append({"type": "enrollment_locked"})
-
-            if decision.enrolled and not decision.send_to_asr:
-                block_asr = True
-                if silence_event:
-                    self._words_this_utterance.clear()
-                    self.realtime_asr.reset_utterance()
-                    events.append({
-                        "type":       "segment_rejected",
-                        "reason":     "speaker_mismatch",
-                        "similarity": decision.similarity,
-                    })
-
-        # ── Step 4: ASR — feed every voice chunk directly to RealTimeChunkASR
-        #
-        # RealTimeChunkASR v2 manages its own FIRE_MS accumulation internally.
-        # We just feed it every voice chunk and let it decide when to fire.
-        # This eliminates the double-buffer coordination problem that caused
-        # words to fall into a gap between pipeline's buffer drain and ASR's
-        # flush on short sentences.
-        if is_voice and not block_asr:
-            # Stamp the start of this utterance on the very first voice chunk
+        # ── Step 5: ASR ────────────────────────────────────────────────────
+        if is_voice:
             if self._utterance_start_ts is None:
                 self._utterance_start_ts = time.monotonic()
+
             result = self.realtime_asr.transcribe_chunk(audio)
 
             partial = result.get("partial", "").strip()
@@ -246,21 +310,16 @@ class STTPipeline:
             if partial and any(c.isalpha() for c in partial):
                 events.append({"type": "partial", "word": partial})
 
-        # ── Step 5: Silence flush ─────────────────────────────────────────
-        # Fire exactly once on the first silent chunk after a voice segment.
-        # flush() runs beam=5 on the full utterance audio — catches every word
-        # that live greedy passes might have missed (especially sentence tails).
-        if silence_event and not block_asr:
+        # ── Step 6: Silence flush ──────────────────────────────────────────
+        if silence_event:
             flush_result = self.realtime_asr.flush()
 
-            # Collect any tail words from flush
             for word in flush_result.get("words", []):
                 w = word if isinstance(word, str) else word.get("word", "")
                 w = w.strip().strip(".,!?;:")
                 if w and any(c.isalpha() for c in w):
                     self._words_this_utterance.append(w)
 
-            # Also use flush_result.text as fallback if live words were empty
             flush_text = flush_result.get("text", "").strip()
             if flush_text and not self._words_this_utterance:
                 for w in flush_text.split():
@@ -271,30 +330,43 @@ class STTPipeline:
             if self._words_this_utterance:
                 text = " ".join(self._words_this_utterance)
 
-                # ── Latency measurement ───────────────────────────────────
                 latency_ms: Optional[float] = None
                 if self._utterance_start_ts is not None:
                     latency_ms = (time.monotonic() - self._utterance_start_ts) * 1000
                     self._latency_history.append(latency_ms)
                     avg_ms = sum(self._latency_history) / len(self._latency_history)
                     print(
-                        f"\n┌─ ASR Latency Report ({'#'+str(len(self._latency_history))})\n"
+                        f"\n┌─ ASR Latency ({'#'+str(len(self._latency_history))})"
+                        f"{'  [BARGE-IN]' if self._barge_in_active else ''}\n"
                         f"│  Text    : {text!r}\n"
-                        f"│  Latency : {latency_ms:>7.1f} ms  ← voice-start → segment\n"
-                        f"│  Average : {avg_ms:>7.1f} ms  (over {len(self._latency_history)} sentence(s))\n"
+                        f"│  Latency : {latency_ms:>7.1f} ms\n"
+                        f"│  Average : {avg_ms:>7.1f} ms  "
+                        f"({len(self._latency_history)} utterances)\n"
                         f"└{'─'*45}"
                     )
-                self._utterance_start_ts = None   # reset for next utterance
-                # ─────────────────────────────────────────────────────────
+                self._utterance_start_ts = None
 
-                events.append({"type": "segment", "text": text, "latency_ms": latency_ms})
-                logger.info(f"[pipeline] segment: {text!r}  latency={latency_ms:.0f}ms" if latency_ms else f"[pipeline] segment: {text!r}")
+                events.append({
+                    "type":       "segment",
+                    "text":       text,
+                    "latency_ms": latency_ms,
+                    "barge_in":   self._barge_in_active,
+                })
+                logger.info(
+                    f"[pipeline] segment{'[BARGE]' if self._barge_in_active else ''}: "
+                    f"{text!r}  latency={latency_ms:.0f}ms"
+                    if latency_ms else
+                    f"[pipeline] segment: {text!r}"
+                )
+
+                self._barge_in_active       = False
+                self._barge_in_voice_frames = 0
 
             self._words_this_utterance.clear()
 
         return events
 
-    # ── REST path ─────────────────────────────────────────────────────────
+    # ── REST path ─────────────────────────────────────────────────────────────
 
     def transcribe_full(self, audio: np.ndarray) -> str:
         result  = self.realtime_asr.transcribe_chunk(audio)
@@ -310,7 +382,6 @@ class STTPipeline:
             if w and any(c.isalpha() for c in w):
                 words_from_live.append(w)
         self._words_this_utterance.clear()
-        # Return the most complete version
         full = result.get("text", "").strip()
         if full:
             return full
@@ -319,29 +390,36 @@ class STTPipeline:
     def reset(self):
         self.vad.reset()
         self.realtime_asr.reset()
-        self._last_is_voice = False
+        self._last_is_voice         = False
         self._words_this_utterance.clear()
-        self._ai_speaking = False
-        self._utterance_start_ts = None
-        self._pre_enroll_buffer.clear()
-        self._was_enrolled = False
+        self._ai_speaking           = False
+        self._barge_in_active       = False
+        self._barge_in_voice_frames = 0
+        self._barge_in_fired_ts     = 0.0
+        self._utterance_start_ts    = None
         if self.aec:
             self.aec.reset()
-        if self.enrollment:
-            self.enrollment.reset()
+        # Voice gate: reset counters but KEEP the enrolled voice profile
+        # so it still works after a session reconnect without re-enrollment
+        if self.voice_gate:
+            self.voice_gate.reset()
 
     def get_stats(self) -> dict:
-        stats = {"vad": self.vad.get_state()}
+        stats = {
+            "vad":             self.vad.get_state(),
+            "barge_in_active": self._barge_in_active,
+            "ai_speaking":     self._ai_speaking,
+        }
         if self.aec:
             stats["aec"] = self.aec.get_stats()
-        if self.enrollment:
-            stats["enrollment"] = self.enrollment.get_stats()
+        if self.voice_gate:
+            stats["voice_gate"] = self.voice_gate.get_stats()
         if self._latency_history:
             stats["latency"] = {
-                "last_ms":    round(self._latency_history[-1], 1),
-                "avg_ms":     round(sum(self._latency_history) / len(self._latency_history), 1),
-                "min_ms":     round(min(self._latency_history), 1),
-                "max_ms":     round(max(self._latency_history), 1),
-                "samples":    len(self._latency_history),
+                "last_ms": round(self._latency_history[-1], 1),
+                "avg_ms":  round(sum(self._latency_history)/len(self._latency_history), 1),
+                "min_ms":  round(min(self._latency_history), 1),
+                "max_ms":  round(max(self._latency_history), 1),
+                "samples": len(self._latency_history),
             }
         return stats

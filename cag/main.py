@@ -1,27 +1,28 @@
 """
-CAG Microservice — Gateway-Ready Entry Point  v4.2
+CAG Microservice — Gateway-Ready Entry Point  v5.0
 ==================================================
 
-FIXES v4.2
-──────────
-ROOT CAUSE of tokens=0:
-  stream_query() is a synchronous generator that internally spawns its OWN
-  thread (via Thread + TextIteratorStreamer in cag_system.py/_generate_thread).
-  Wrapping it in run_in_executor() put the generator's for-loop in a thread-
-  pool worker, while _generate_thread ran in yet another thread — the
-  call_soon_threadsafe() inside stream_query fed tokens into the asyncio queue,
-  but the thread-pool worker was BLOCKED on `for chunk in streamer` and never
-  called loop.call_soon_threadsafe at all.  Result: 0 tokens, timeout every time.
+NEW in v5.0
+───────────
+  WebSocket endpoint  /chat/ws
+  ─────────────────────────────
+  Adds a persistent WebSocket stream alongside the existing HTTP SSE endpoint.
+  The gateway prefers the WS endpoint for minimal framing overhead.
 
-  The fix: run a thin _producer() in the executor that iterates stream_query()
-  synchronously and pushes each token into the asyncio queue via
-  call_soon_threadsafe.  stream_query's own internal Thread handles the GPU
-  work; the executor thread is just a lightweight drainer.
+  Protocol:
+    → {"type": "query", "turn_id": "...", "message": "...", "reset": bool}
+    ← {"type": "turn_id",  "turn_id": "..."}        (first frame — routing confirm)
+    ← {"type": "token",    "token": "...", "turn_id": "..."}
+    ← {"type": "done",     "turn_id": "..."}
+    ← {"type": "error",    "detail": "...", "turn_id": "..."}
+    ← {"type": "timeout",  "turn_id": "..."}
 
-Other changes:
-  - TOKEN_TIMEOUT_S default raised 8s → 30s.
-  - gpu_lock released only after producer thread signals done.
+  Multiple concurrent sessions are each tracked by their own turn_id.
+  The GPU lock serializes inference; if another turn arrives while inference
+  is running, it waits in a per-connection queue.
 """
+
+from __future__ import annotations
 
 import asyncio
 import collections
@@ -37,7 +38,7 @@ from statistics import mean, quantiles
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import torch
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -58,6 +59,9 @@ log = logging.getLogger("cag.service")
 DEDUP_WINDOW_S   = float(os.getenv("DEDUP_WINDOW_S",  "2.0"))
 TOKEN_TIMEOUT_S  = float(os.getenv("TOKEN_TIMEOUT_S", "30.0"))
 DEDUP_CACHE_SIZE = 4
+
+# Max queries to hold per WebSocket connection before dropping
+WS_QUERY_QUEUE_MAX = int(os.getenv("WS_QUERY_QUEUE_MAX", "4"))
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -176,6 +180,18 @@ def _validate_config(cfg: CAGConfig):
         raise RuntimeError("CAGConfig validation failed: " + "; ".join(errors))
 
 
+def _make_turn_id(hint: Optional[str] = None) -> str:
+    return hint or str(uuid.uuid4())
+
+
+def _assert_ready():
+    if not svc.ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="CAG not ready",
+        )
+
+
 svc = ServiceState()
 
 
@@ -192,7 +208,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Ask Novation — CAG Inference Service",
-    version="4.2.0",
+    version="5.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -210,9 +226,9 @@ app.add_middleware(
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=4096)
-    reset_session: bool = Field(default=True)
-    turn_id: Optional[str] = Field(default=None)
+    message:       str           = Field(..., min_length=1, max_length=4096)
+    reset_session: bool          = Field(default=True)
+    turn_id:       Optional[str] = Field(default=None)
 
 
 class ChatResponse(BaseModel):
@@ -227,92 +243,33 @@ class HealthResponse(BaseModel):
     status         : str
     uptime_seconds : Optional[float]
     gpu_free_mb    : Optional[int]
-    gpu_temp_c     : Optional[int]
+    version        : str
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 
-def _assert_ready():
-    if not svc.ready:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model is still loading. Try again shortly.",
-        )
-
-
-def _make_turn_id(client_id: Optional[str]) -> str:
-    return client_id or str(uuid.uuid4())
-
-
-def _gpu_temp() -> Optional[int]:
-    try:
-        if torch.cuda.is_available():
-            return torch.cuda.temperature()
-    except Exception:
-        pass
-    return None
-
-
-# ── Routes ────────────────────────────────────────────────────────────────────
-
-@app.get("/health", response_model=HealthResponse, tags=["ops"])
+@app.get("/health", response_model=HealthResponse, tags=["system"])
 async def health():
-    gpu_free = None
-    if torch.cuda.is_available():
-        gpu_free = torch.cuda.mem_get_info()[0] // 1024 ** 2
     uptime = None
     if svc.boot_time:
-        uptime = (datetime.utcnow() - svc.boot_time).total_seconds()
+        uptime = round((datetime.utcnow() - svc.boot_time).total_seconds(), 1)
+    gpu_free = None
+    if torch.cuda.is_available():
+        free, _ = torch.cuda.mem_get_info()
+        gpu_free = free // (1024 * 1024)
     return HealthResponse(
-        status="ok",
+        status="ok" if svc.ready else "starting",
         uptime_seconds=uptime,
         gpu_free_mb=gpu_free,
-        gpu_temp_c=_gpu_temp(),
+        version="5.0.0",
     )
 
 
-@app.get("/ready", tags=["ops"])
-async def ready():
-    if not svc.ready:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"ready": False, "detail": "Model loading…"},
-        )
-    return {"ready": True}
-
-
-@app.get("/stats", tags=["ops"])
-async def stats():
-    _assert_ready()
-    base_stats = svc.cag.get_stats()
-    gpu_info: Dict[str, Any] = {}
-    if torch.cuda.is_available():
-        free_mb  = torch.cuda.mem_get_info()[0] // 1024 ** 2
-        total_mb = torch.cuda.mem_get_info()[1] // 1024 ** 2
-        gpu_info = {
-            "free_mb":         free_mb,
-            "total_mb":        total_mb,
-            "used_mb":         total_mb - free_mb,
-            "utilization_pct": round((total_mb - free_mb) / total_mb * 100, 1),
-            "temp_c":          _gpu_temp(),
-        }
-    return {
-        "knowledge_entries":      base_stats.get("knowledge", {}).get("entries", 0),
-        "knowledge_tokens":       base_stats.get("knowledge", {}).get("tokens", 0),
-        "cache_initialized":      base_stats.get("cache", {}).get("initialized", False),
-        "cache_knowledge_tokens": base_stats.get("cache", {}).get("knowledge_tokens", 0),
-        "flash_attention":        base_stats.get("config", {}).get("flash_attention", False),
-        "total_queries":          base_stats.get("total_queries", 0),
-        "gpu":                    gpu_info,
-        "boot_time":              svc.boot_time.isoformat() if svc.boot_time else None,
-    }
-
-
-@app.get("/metrics", tags=["ops"], response_class=PlainTextResponse)
+@app.get("/metrics", response_class=PlainTextResponse, tags=["system"])
 async def prometheus_metrics():
-    snap = metrics.snapshot()
+    snap  = metrics.snapshot()
     lines = [
-        "# HELP cag_total_queries Total number of inference requests",
+        "# HELP cag_total_queries Total number of chat queries received",
         "# TYPE cag_total_queries counter",
         f"cag_total_queries {snap['total_queries']}",
         "# HELP cag_total_errors Total number of failed requests",
@@ -390,24 +347,14 @@ async def chat(req: ChatRequest):
 async def chat_stream(req: ChatRequest):
     """
     Single-turn streaming chat via Server-Sent Events.
+    Kept for backward compatibility. Prefer the /chat/ws WebSocket endpoint
+    for lower latency.
 
     Token format:    data: <token>\\n\\n
-    Turn header:     data: [TURN_ID] <uuid>\\n\\n   ← first event
+    Turn header:     data: [TURN_ID] <uuid>\\n\\n
     Done signal:     data: [DONE]\\n\\n
     Error signal:    data: [ERROR] <message>\\n\\n
     Timeout signal:  data: [TIMEOUT]\\n\\n
-
-    KEY DESIGN NOTE
-    ───────────────
-    stream_query() is a sync generator that internally spawns its own Thread
-    (via TextIteratorStreamer + _generate_thread in cag_system.py).
-
-    We run a thin _producer() in run_in_executor — it iterates stream_query()
-    synchronously and forwards each token to the asyncio queue via
-    call_soon_threadsafe.  The GPU work stays on stream_query's daemon Thread.
-
-    Do NOT call stream_query() inside an async for loop directly — it would
-    block the event loop on the TextIteratorStreamer.
     """
     _assert_ready()
     turn_id = _make_turn_id(req.turn_id)
@@ -426,18 +373,12 @@ async def chat_stream(req: ChatRequest):
         token_count  = [0]
         error_flag   = [False]
 
-        # ── Turn-id header (gateway correlation) ──────────────────────────
         yield f"data: [TURN_ID] {turn_id}\n\n"
 
         def _producer():
-            """
-            Thread-pool worker: drains stream_query() and forwards tokens.
-            stream_query() manages its own GPU thread internally.
-            """
             try:
                 if req.reset_session:
                     svc.reset_session()
-
                 for chunk in svc.cag.stream_query(req.message):
                     if cancel_event.is_set():
                         log.info(f"[turn:{turn_id}] stream cancelled by client")
@@ -445,7 +386,6 @@ async def chat_stream(req: ChatRequest):
                     if chunk:
                         token_count[0] += 1
                         loop.call_soon_threadsafe(q.put_nowait, ("token", chunk))
-
             except Exception as exc:
                 error_flag[0] = True
                 loop.call_soon_threadsafe(q.put_nowait, ("error", str(exc)))
@@ -455,47 +395,34 @@ async def chat_stream(req: ChatRequest):
         try:
             async with svc._gpu_lock:
                 producer_future = loop.run_in_executor(None, _producer)
-
                 try:
                     while True:
                         try:
-                            kind, value = await asyncio.wait_for(
-                                q.get(), timeout=TOKEN_TIMEOUT_S
-                            )
+                            kind, value = await asyncio.wait_for(q.get(), timeout=TOKEN_TIMEOUT_S)
                         except asyncio.TimeoutError:
-                            log.warning(
-                                f"[turn:{turn_id}] token timeout after {TOKEN_TIMEOUT_S}s"
-                            )
+                            log.warning(f"[turn:{turn_id}] token timeout after {TOKEN_TIMEOUT_S}s")
                             cancel_event.set()
                             error_flag[0] = True
                             yield f"data: [TIMEOUT]\n\n"
                             break
-
                         if kind == "token":
                             yield f"data: {value}\n\n"
                         elif kind == "error":
                             log.error(f"[turn:{turn_id}] producer error: {value}")
                             yield f"data: [ERROR] {value}\n\n"
                             break
-                        else:  # "done"
+                        else:
                             break
-
                 finally:
-                    # Always signal stop and wait for the producer thread to
-                    # finish before releasing the GPU lock.
                     cancel_event.set()
                     try:
-                        await asyncio.wait_for(
-                            asyncio.wrap_future(producer_future), timeout=10.0
-                        )
+                        await asyncio.wait_for(asyncio.wrap_future(producer_future), timeout=10.0)
                     except Exception:
                         pass
-
         except asyncio.CancelledError:
             cancel_event.set()
             log.info(f"[turn:{turn_id}] stream cancelled (client disconnect)")
             return
-
         finally:
             lat_ms = (time.monotonic() - t0) * 1000
             metrics.record(lat_ms, error=error_flag[0])
@@ -517,6 +444,189 @@ async def chat_stream(req: ChatRequest):
             "X-Turn-Id":         turn_id,
         },
     )
+
+
+# ── Chat (WebSocket streaming) ────────────────────────────────────────────────
+
+@app.websocket("/chat/ws")
+async def chat_ws(ws: WebSocket):
+    """
+    Persistent WebSocket endpoint for low-latency streaming inference.
+
+    Each message from the gateway is a JSON query frame:
+      {"type": "query", "turn_id": "...", "message": "...", "reset": bool}
+
+    Each response token is a JSON frame:
+      {"type": "turn_id", "turn_id": "..."}     ← first frame, routing confirm
+      {"type": "token",   "token":  "...", "turn_id": "..."}
+      {"type": "done",    "turn_id": "..."}
+      {"type": "error",   "detail": "...", "turn_id": "..."}
+      {"type": "timeout", "turn_id": "..."}
+
+    Advantages over SSE:
+      • Full-duplex: gateway can send barge-in cancel while tokens are flowing
+      • Lower per-frame overhead: no HTTP chunked encoding / SSE data prefix
+      • Single TCP connection per session vs one per query with SSE
+    """
+    await ws.accept()
+    conn_id = str(uuid.uuid4())[:8]
+    log.info(f"[ws:{conn_id}] CAG WebSocket connected")
+
+    # Per-connection query queue — allows pipelining when GPU is busy
+    query_q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUERY_QUEUE_MAX)
+
+    async def _receiver():
+        """Read query frames from the gateway and enqueue them."""
+        try:
+            async for raw in ws.iter_text():
+                try:
+                    frame = json_loads(raw)
+                except Exception:
+                    continue
+                if frame.get("type") != "query":
+                    continue
+                msg = frame.get("message", "").strip()
+                if not msg:
+                    continue
+                if query_q.full():
+                    log.warning(f"[ws:{conn_id}] query queue full — dropping oldest")
+                    try:
+                        query_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                await query_q.put(frame)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            # Sentinel to stop processor
+            await query_q.put(None)
+
+    async def _processor():
+        """Process queries one at a time (serialized by GPU lock), stream tokens back."""
+        while True:
+            frame = await query_q.get()
+            if frame is None:
+                break
+
+            turn_id  = frame.get("turn_id") or str(uuid.uuid4())
+            message  = frame.get("message", "").strip()
+            do_reset = frame.get("reset", False)
+
+            if not message:
+                continue
+
+            if dedup.is_duplicate(message):
+                try:
+                    await ws.send_json({"type": "error", "detail": "duplicate_query", "turn_id": turn_id})
+                except Exception:
+                    pass
+                continue
+
+            log.info(f"[ws:{conn_id}] turn:{turn_id} query={message[:60]!r}")
+
+            # Confirm turn routing
+            try:
+                await ws.send_json({"type": "turn_id", "turn_id": turn_id})
+            except Exception:
+                break
+
+            loop         = asyncio.get_event_loop()
+            q            : asyncio.Queue = asyncio.Queue()
+            cancel_event = threading.Event()
+            t0           = time.monotonic()
+            token_count  = [0]
+            error_flag   = [False]
+
+            def _producer():
+                try:
+                    if do_reset:
+                        svc.reset_session()
+                    for chunk in svc.cag.stream_query(message):
+                        if cancel_event.is_set():
+                            break
+                        if chunk:
+                            token_count[0] += 1
+                            loop.call_soon_threadsafe(q.put_nowait, ("token", chunk))
+                except Exception as exc:
+                    error_flag[0] = True
+                    loop.call_soon_threadsafe(q.put_nowait, ("error", str(exc)))
+                finally:
+                    loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+
+            try:
+                async with svc._gpu_lock:
+                    producer_future = loop.run_in_executor(None, _producer)
+                    try:
+                        while True:
+                            try:
+                                kind, value = await asyncio.wait_for(
+                                    q.get(), timeout=TOKEN_TIMEOUT_S
+                                )
+                            except asyncio.TimeoutError:
+                                log.warning(f"[ws:{conn_id}] turn:{turn_id} token timeout")
+                                cancel_event.set()
+                                error_flag[0] = True
+                                await ws.send_json({"type": "timeout", "turn_id": turn_id})
+                                break
+
+                            if kind == "token":
+                                await ws.send_json({"type": "token", "token": value, "turn_id": turn_id})
+                            elif kind == "error":
+                                log.error(f"[ws:{conn_id}] turn:{turn_id} producer error: {value}")
+                                await ws.send_json({"type": "error", "detail": value, "turn_id": turn_id})
+                                error_flag[0] = True
+                                break
+                            else:  # done
+                                break
+
+                    finally:
+                        cancel_event.set()
+                        try:
+                            await asyncio.wait_for(asyncio.wrap_future(producer_future), timeout=10.0)
+                        except Exception:
+                            pass
+
+            except WebSocketDisconnect:
+                cancel_event.set()
+                break
+            except Exception as e:
+                log.error(f"[ws:{conn_id}] turn:{turn_id} error: {e}")
+                error_flag[0] = True
+                try:
+                    await ws.send_json({"type": "error", "detail": str(e), "turn_id": turn_id})
+                except Exception:
+                    break
+            finally:
+                lat_ms = (time.monotonic() - t0) * 1000
+                metrics.record(lat_ms, error=error_flag[0])
+                log.info(
+                    f"[ws:{conn_id}] turn:{turn_id} done "
+                    f"tokens={token_count[0]} lat={round(lat_ms)}ms"
+                )
+
+            # Send done frame
+            try:
+                await ws.send_json({"type": "done", "turn_id": turn_id})
+            except Exception:
+                break
+
+    try:
+        await asyncio.gather(_receiver(), _processor())
+    except Exception as e:
+        log.error(f"[ws:{conn_id}] fatal: {e}")
+    finally:
+        log.info(f"[ws:{conn_id}] disconnected")
+
+
+# ── JSON helper ───────────────────────────────────────────────────────────────
+
+import json as _json
+
+
+def json_loads(raw) -> dict:
+    if isinstance(raw, (bytes, bytearray)):
+        return _json.loads(raw.decode())
+    return _json.loads(raw)
 
 
 # ── Global error handler ──────────────────────────────────────────────────────
