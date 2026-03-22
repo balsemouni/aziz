@@ -379,7 +379,8 @@ async def chat_stream(req: ChatRequest):
             try:
                 if req.reset_session:
                     svc.reset_session()
-                for chunk in svc.cag.stream_query(req.message):
+                # stream_chunks() yields complete TTS-ready sentence chunks
+                for chunk in svc.cag.stream_chunks(req.message):
                     if cancel_event.is_set():
                         log.info(f"[turn:{turn_id}] stream cancelled by client")
                         break
@@ -503,6 +504,8 @@ async def chat_ws(ws: WebSocket):
 
     async def _processor():
         """Process queries one at a time (serialized by GPU lock), stream tokens back."""
+        ws_alive = True  # track whether the WebSocket is still open
+
         while True:
             frame = await query_q.get()
             if frame is None:
@@ -516,18 +519,22 @@ async def chat_ws(ws: WebSocket):
                 continue
 
             if dedup.is_duplicate(message):
-                try:
-                    await ws.send_json({"type": "error", "detail": "duplicate_query", "turn_id": turn_id})
-                except Exception:
-                    pass
+                if ws_alive:
+                    try:
+                        await ws.send_json({"type": "error", "detail": "duplicate_query", "turn_id": turn_id})
+                    except Exception:
+                        ws_alive = False
                 continue
 
             log.info(f"[ws:{conn_id}] turn:{turn_id} query={message[:60]!r}")
 
-            # Confirm turn routing
+            # Confirm turn routing — bail out entirely if WS already closed
+            if not ws_alive:
+                break
             try:
                 await ws.send_json({"type": "turn_id", "turn_id": turn_id})
             except Exception:
+                ws_alive = False
                 break
 
             loop         = asyncio.get_event_loop()
@@ -541,7 +548,10 @@ async def chat_ws(ws: WebSocket):
                 try:
                     if do_reset:
                         svc.reset_session()
-                    for chunk in svc.cag.stream_query(message):
+                    # stream_chunks() yields complete TTS-ready sentence chunks
+                    # (not raw sub-word tokens) so the gateway can dispatch each
+                    # chunk to TTS immediately without any further accumulation.
+                    for chunk in svc.cag.stream_chunks(message):
                         if cancel_event.is_set():
                             break
                         if chunk:
@@ -552,6 +562,19 @@ async def chat_ws(ws: WebSocket):
                     loop.call_soon_threadsafe(q.put_nowait, ("error", str(exc)))
                 finally:
                     loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+
+            # send_ws helper — marks ws_alive=False on any failure so we
+            # never attempt another send after the connection is gone
+            async def _send(payload: dict) -> bool:
+                nonlocal ws_alive
+                if not ws_alive:
+                    return False
+                try:
+                    await ws.send_json(payload)
+                    return True
+                except Exception:
+                    ws_alive = False
+                    return False
 
             try:
                 async with svc._gpu_lock:
@@ -566,14 +589,16 @@ async def chat_ws(ws: WebSocket):
                                 log.warning(f"[ws:{conn_id}] turn:{turn_id} token timeout")
                                 cancel_event.set()
                                 error_flag[0] = True
-                                await ws.send_json({"type": "timeout", "turn_id": turn_id})
+                                await _send({"type": "timeout", "turn_id": turn_id})
                                 break
 
                             if kind == "token":
-                                await ws.send_json({"type": "token", "token": value, "turn_id": turn_id})
+                                if not await _send({"type": "token", "token": value, "turn_id": turn_id}):
+                                    cancel_event.set()
+                                    break
                             elif kind == "error":
                                 log.error(f"[ws:{conn_id}] turn:{turn_id} producer error: {value}")
-                                await ws.send_json({"type": "error", "detail": value, "turn_id": turn_id})
+                                await _send({"type": "error", "detail": value, "turn_id": turn_id})
                                 error_flag[0] = True
                                 break
                             else:  # done
@@ -587,14 +612,14 @@ async def chat_ws(ws: WebSocket):
                             pass
 
             except WebSocketDisconnect:
+                ws_alive = False
                 cancel_event.set()
                 break
             except Exception as e:
                 log.error(f"[ws:{conn_id}] turn:{turn_id} error: {e}")
                 error_flag[0] = True
-                try:
-                    await ws.send_json({"type": "error", "detail": str(e), "turn_id": turn_id})
-                except Exception:
+                await _send({"type": "error", "detail": str(e), "turn_id": turn_id})
+                if not ws_alive:
                     break
             finally:
                 lat_ms = (time.monotonic() - t0) * 1000
@@ -604,10 +629,8 @@ async def chat_ws(ws: WebSocket):
                     f"tokens={token_count[0]} lat={round(lat_ms)}ms"
                 )
 
-            # Send done frame
-            try:
-                await ws.send_json({"type": "done", "turn_id": turn_id})
-            except Exception:
+            # Send done frame only if the connection is still alive
+            if not await _send({"type": "done", "turn_id": turn_id}):
                 break
 
     try:

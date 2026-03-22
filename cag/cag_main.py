@@ -56,6 +56,10 @@ def hubspot_finish(hubspot, cag_system: "CAGSystemWithMemory"):
     """
     Finalise and push the session to HubSpot.
     Pulls the user name and LLM summary from cag_system automatically.
+
+    Note: HubSpotManager.set_user_name() is idempotent — it skips the
+    contact lookup if the name and contact_id are already set, so calling
+    it here a second time will never create a duplicate contact.
     """
     if not hubspot:
         return
@@ -63,7 +67,7 @@ def hubspot_finish(hubspot, cag_system: "CAGSystemWithMemory"):
     # ── 1. User name ────────────────────────────────────────────────────
     user_name = getattr(cag_system.memory.user_profile, "name", None)
     if user_name:
-        hubspot.set_user_name(user_name)
+        hubspot.set_user_name(user_name)  # no-op if already resolved this session
 
     # ── 2. LLM summary ──────────────────────────────────────────────────
     print("\n🧠 Generating LLM session summary for HubSpot...")
@@ -180,13 +184,24 @@ def interactive_mode(cag_system: CAGSystemWithMemory, use_streaming: bool = True
             response_text = ""
 
             if use_streaming:
+                stream_error = None
                 try:
                     for token in cag_system.stream_query(query):
                         print(token, end="", flush=True)
                         response_text += token
                     print()
                 except Exception as e:
-                    print(f"\n❌ Error: {e}")
+                    stream_error = e
+                    print(f"\n❌ Streaming error: {e}")
+                # If streaming produced nothing, fall back to batch mode
+                if stream_error and not response_text:
+                    try:
+                        result = cag_system.query(query)
+                        if result["success"]:
+                            response_text = result["answer"]
+                            print(f"🤖 (batch fallback): {response_text}")
+                    except Exception as e2:
+                        print(f"❌ Batch fallback also failed: {e2}")
             else:
                 result = cag_system.query(query)
                 if result["success"]:

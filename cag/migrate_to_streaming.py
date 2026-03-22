@@ -146,10 +146,12 @@ class StreamingMigrator:
         print("\n" + "="*70)
         print("🚀 MIGRATING TO STREAMING")
         print("="*70)
-        
+
         if self._is_already_migrated():
-            print("\n✅ System already has streaming capabilities!")
-            print("   No migration needed.")
+            print("\n✅ System already has streaming capabilities — migration skipped.")
+            print("   Running --migrate again on an already-migrated codebase would")
+            print("   corrupt cag_system.py by inserting duplicate methods.")
+            print("   No action taken.")
             return True
         
         # Step 1: Replace model_loader.py
@@ -194,22 +196,24 @@ class StreamingMigrator:
         """Add streaming methods to cag_system.py"""
         system_file = self.base_dir / 'cag_system.py'
         addon_file = self.base_dir / 'cag_system_streaming_addon.py'
-        
+
         if not system_file.exists():
             print("   ❌ cag_system.py not found!")
             return False
-        
+
         if not addon_file.exists():
             print("   ❌ cag_system_streaming_addon.py not found!")
             return False
-        
+
         # Read current system file
         with open(system_file, 'r') as f:
             content = f.read()
-        
-        # Check if already has streaming
+
+        # HARD ABORT: if stream_query already exists, do NOT proceed.
+        # Inserting text into an already-migrated file would create
+        # duplicate method definitions and corrupt the class.
         if 'def stream_query' in content:
-            print("   ✅ cag_system.py already has streaming methods")
+            print("   ✅ cag_system.py already has streaming methods — no changes made.")
             return True
         
         # Read addon methods

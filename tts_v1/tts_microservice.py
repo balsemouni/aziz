@@ -1,35 +1,63 @@
 """
-tts_microservice.py  v3.0.0  —  XTTS-v2 + Background TTS Self-Enrollment
+tts_microservice.py  v5.4.0  —  Orpheus TTS (llama-cpp-python GGUF + SNAC)
 ═══════════════════════════════════════════════════════════════════════════
 
-WHAT'S NEW IN v3.0
-───────────────────
-Background TTS Self-Enrollment
-  After XTTS-v2 finishes loading, a background asyncio task fires immediately.
-  It synthesizes a fixed enrollment phrase using the configured voice, resamples
-  it from 24 kHz → 16 kHz, and POSTs the raw PCM (base64-encoded) to STT's
-  POST /enroll_tts endpoint.
-  The STT pipeline feeds that audio into TTSVoiceFilter and locks the profile.
-  From that point forward, the STT silently blocks its own TTS echo — no
-  greeting needed, no gateway involvement, no client-side enrollment logic.
+ROOT-CAUSE FIXES vs v5.3.0
+──────────────────────────
+PROBLEM 1 — ~100s latency on first real request
+  The pre-warm sentence held the worker queue.  Real requests waited 22-80s.
+  FIX: pre-warm runs in its OWN daemon thread, never touches the worker
+  queue.  Real requests start immediately after engine.load() returns.
 
-  The whole flow is invisible to the user.
+PROBLEM 2 — New WS connection per sentence = cold llama context per sentence
+  Each /ws/tts connection cold-started llama context, producing robotic
+  speech at sentence boundaries and stacking queue latency per sentence.
+  FIX: /ws/tts is now a PERSISTENT SESSION.  One connection per AI turn.
+  The gateway keeps it open, sends one JSON per sentence, reads PCM+sentinel,
+  then sends the next.  Llama context stays warm across sentences.
 
-Enrollment API (this service)
-─────────────────────────────
-  GET  /enrollment_status   → { enrolled, progress, retries, error }
-  POST /enroll_tts          → trigger re-enrollment (after voice change)
-  DELETE /enrollment        → reset local enrollment state (testing)
+PROBLEM 3 — chunk_tone misclassification → horrible audio quality
+  chunk_tone was passed in from the gateway (always wrong) and used verbatim.
+  FIX: chunk type is now auto-detected from text length + punctuation.
+  The hint field is still accepted but defaults to "auto".
 
-STT endpoint required  →  see main.py (add POST /enroll_tts there)
-  The handler code is included at the bottom of this file as a comment block.
+PROBLEM 4 — flush check fired on every token (including non-audio tokens)
+  FIX: flush check now only executes when an audio token is appended.
 
-All v2 features unchanged:
-  per-chunk latency, tone/logic chunking, prosody hints, WS + REST endpoints.
+PROBLEM 5 — synthesize_stream swallowed PCM bytes instead of yielding them
+  REST /tts/stream was waiting for each full chunk before sending anything.
+  FIX: synthesize_stream now yields (chunk, raw_bytes) tuples so the REST
+  route can forward PCM as it arrives.
+
+WS Protocol (persistent session):
+  Per-request:
+    CLIENT → JSON { "text":"...", "voice":"tara", "chunk_tone":"auto" }
+    SERVER → binary WAV header (44 bytes)
+           → binary PCM chunks (int16 24kHz, streamed live)
+           → JSON  { "type":"chunk_meta", ... }
+           → binary b""  ← end-of-request sentinel (send next request now)
+  Control (any time):
+    CLIENT → JSON { "type":"cancel" }   abort current synthesis
+    CLIENT → JSON { "type":"close" }    graceful disconnect
+    CLIENT → JSON { "type":"ping" }  →  SERVER { "type":"pong" }
+  Heartbeat every 15s keeps NAT/proxies alive.
+
+Model config (env vars):
+  ORPHEUS_HF_REPO     QuantFactory/orpheus-3b-0.1-ft-GGUF
+  ORPHEUS_GGUF_FILE   orpheus-3b-0.1-ft.Q2_K.gguf
+  ORPHEUS_TOKENIZER   unsloth/orpheus-3b-0.1-ft
+  ORPHEUS_GPU_LAYERS  -1
+  ORPHEUS_CTX         768   (reduced from 900 — saves KV-cache, lower latency)
+  ORPHEUS_BATCH       256
+  ORPHEUS_THREADS     4
+  ORPHEUS_VOICE       tara
+
+Sample rate: 24 000 Hz mono int16 PCM.
 """
 
 import asyncio
 import base64
+import collections
 import io
 import json
 import logging
@@ -39,21 +67,21 @@ import struct
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
-import httpx
 import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Configuration
+#  Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -62,35 +90,120 @@ logging.basicConfig(
 )
 log = logging.getLogger("tts_service")
 
-SAMPLE_RATE        = 24000
-PRE_BUFFER_CHUNKS  = 2
-MAX_QUEUE_SIZE     = 20
-DEFAULT_LANGUAGE   = "en"
-DEFAULT_SPEAKER_WAV: Optional[str] = None
-DEFAULT_SPEAKER    = "Claribel Dervla"
 
-# ── Self-enrollment settings ──────────────────────────────────────────────────
-#   Override via environment variables if needed.
+# ─────────────────────────────────────────────────────────────────────────────
+#  Configuration
+# ─────────────────────────────────────────────────────────────────────────────
 
-STT_ENROLL_URL     = os.getenv("STT_ENROLL_URL", "http://localhost:8001/enroll_tts")
-STT_RESET_URL      = os.getenv("STT_RESET_URL",  "http://localhost:8001/enroll_tts")
+SAMPLE_RATE    = 24_000
+MAX_QUEUE_SIZE = 20
+DEFAULT_LANGUAGE = "en"
 
-# Sample rate the STT pipeline expects
-ENROLL_TARGET_SR   = int(os.getenv("ENROLL_TARGET_SR", "16000"))
+HF_REPO        = os.getenv("ORPHEUS_HF_REPO",   "QuantFactory/orpheus-3b-0.1-ft-GGUF")
+GGUF_FILENAME  = os.getenv("ORPHEUS_GGUF_FILE",  "orpheus-3b-0.1-ft.Q2_K.gguf")
+TOKENIZER_REPO = os.getenv("ORPHEUS_TOKENIZER",  "unsloth/orpheus-3b-0.1-ft")
 
-# The text synthesized for enrollment — never played to the user.
-# Longer and phonetically diverse = better voice profile.
-ENROLLMENT_TEXT    = os.getenv(
-    "TTS_ENROLLMENT_TEXT",
-    "Hello, I am Nova, your intelligent voice assistant. "
-    "I can help you with questions, tasks, and detailed information. "
-    "My voice is clear and natural, designed to be easy to understand. "
-    "Feel free to ask me anything at all, I am always happy to help. "
-    "What can I help you with today? I am ready to assist you."
-)
+N_GPU_LAYERS = int(os.getenv("ORPHEUS_GPU_LAYERS", "-1"))
+N_CTX        = int(os.getenv("ORPHEUS_CTX",        "768"))
+N_BATCH      = int(os.getenv("ORPHEUS_BATCH",      "256"))
+N_THREADS    = int(os.getenv("ORPHEUS_THREADS",    "4"))
 
-ENROLL_MAX_RETRIES = int(os.getenv("ENROLL_MAX_RETRIES", "3"))
-ENROLL_RETRY_S     = float(os.getenv("ENROLL_RETRY_S",   "3.0"))
+ORPHEUS_VOICE  = os.getenv("ORPHEUS_VOICE", "tara")
+ORPHEUS_VOICES = {"tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"}
+
+SOH_ID       = 128259
+EOT_ID       = 128009
+EOH_ID       = 128260
+START_TOKEN  = 128257
+END_TOKENS   = {128258, 49158}
+AUDIO_OFFSET = 128266
+SNAC_VOCAB   = 4096
+TPF          = 7    # tokens per SNAC frame ≈ 12 ms
+
+INIT_FRAMES    = 1  # first flush: ~12 ms
+STREAM_FRAMES  = 2  # subsequent: ~24 ms
+MAX_EMPTY_SNAC = 3
+
+TEMPERATURE        = 0.6
+TOP_P              = 0.8
+REPETITION_PENALTY = 1.1
+MAX_TOKENS         = 1200
+
+TONE_CHAR_LIMIT        = 80   # text ≤ this → tone mode
+WS_HEARTBEAT_INTERVAL  = 15   # seconds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Latency Stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LatencyStats:
+    WINDOW = 10
+
+    def __init__(self):
+        self._lock             = threading.Lock()
+        self._data: Dict[str, collections.deque] = {}
+        self._total_requests   = 0
+        self._total_errors     = 0
+        self._total_chars      = 0
+
+    def record(self, voice: str, first_chunk_ms: float, chars: int) -> None:
+        with self._lock:
+            self._data.setdefault(voice, collections.deque(maxlen=self.WINDOW))
+            self._data[voice].append(first_chunk_ms)
+            self._total_requests += 1
+            self._total_chars    += chars
+
+    def record_error(self) -> None:
+        with self._lock:
+            self._total_errors += 1
+
+    def summary(self) -> dict:
+        with self._lock:
+            out: dict = {
+                "total_requests": self._total_requests,
+                "total_errors":   self._total_errors,
+                "total_chars":    self._total_chars,
+                "voices":         {},
+            }
+            for voice, dq in self._data.items():
+                if not dq:
+                    continue
+                arr = sorted(dq)
+                n   = len(arr)
+                out["voices"][voice] = {
+                    "samples": n,
+                    "avg_ms":  round(sum(arr) / n, 1),
+                    "p50_ms":  round(arr[n // 2], 1),
+                    "p95_ms":  round(arr[min(int(n * 0.95), n - 1)], 1),
+                }
+            return out
+
+    def prometheus(self) -> str:
+        s     = self.summary()
+        lines = [
+            "# HELP orpheus_requests_total Total synthesis requests",
+            "# TYPE orpheus_requests_total counter",
+            f'orpheus_requests_total {s["total_requests"]}',
+            "# HELP orpheus_errors_total Total synthesis errors",
+            "# TYPE orpheus_errors_total counter",
+            f'orpheus_errors_total {s["total_errors"]}',
+            "# HELP orpheus_chars_total Total characters synthesized",
+            "# TYPE orpheus_chars_total counter",
+            f'orpheus_chars_total {s["total_chars"]}',
+        ]
+        for voice, vs in s["voices"].items():
+            lbl = f'voice="{voice}"'
+            for metric, val in [
+                ("orpheus_latency_avg_ms", vs["avg_ms"]),
+                ("orpheus_latency_p50_ms", vs["p50_ms"]),
+                ("orpheus_latency_p95_ms", vs["p95_ms"]),
+            ]:
+                lines.append(f"{metric}{{{lbl}}} {val}")
+        return "\n".join(lines) + "\n"
+
+
+_stats = LatencyStats()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,6 +213,14 @@ ENROLL_RETRY_S     = float(os.getenv("ENROLL_RETRY_S",   "3.0"))
 class ChunkType(str, Enum):
     TONE  = "tone"
     LOGIC = "logic"
+
+
+def _auto_chunk_type(text: str) -> ChunkType:
+    """Detect chunk type from the actual text — never trust caller hint."""
+    stripped = text.rstrip()
+    if len(stripped) <= TONE_CHAR_LIMIT or stripped.endswith("?") or stripped.endswith("!"):
+        return ChunkType.TONE
+    return ChunkType.LOGIC
 
 
 @dataclass
@@ -143,18 +264,17 @@ class AudioChunk:
 
 @dataclass
 class SynthesisJob:
-    job_id:      str
-    text:        str
-    language:    str              = DEFAULT_LANGUAGE
-    speaker_wav: Optional[str]   = None
-    speaker:     Optional[str]   = None
-    chunks:      list             = field(default_factory=list)
-    audio_queue: queue.Queue      = field(default_factory=lambda: queue.Queue(maxsize=MAX_QUEUE_SIZE))
-    done:        threading.Event  = field(default_factory=threading.Event)
-    cancelled:   bool             = False
-    start_ts:    float            = field(default_factory=time.time)
-    _first_chunk_ready_ts: float  = 0.0
-    _lock: threading.Lock         = field(default_factory=threading.Lock)
+    job_id:    str
+    text:      str
+    language:  str           = DEFAULT_LANGUAGE
+    voice:     Optional[str] = None
+    chunks:    list          = field(default_factory=list)
+    audio_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=MAX_QUEUE_SIZE))
+    done:      threading.Event = field(default_factory=threading.Event)
+    cancelled: bool            = False
+    start_ts:  float           = field(default_factory=time.time)
+    _first_chunk_ready_ts: float = 0.0
+    _lock:     threading.Lock  = field(default_factory=threading.Lock)
 
     def record_first_chunk(self, ts: float) -> None:
         with self._lock:
@@ -166,31 +286,17 @@ class SynthesisJob:
         return self._first_chunk_ready_ts
 
 
-# ── Request / Response schemas ────────────────────────────────────────────────
-
 class TTSRequest(BaseModel):
-    text:        str
-    language:    str           = DEFAULT_LANGUAGE
-    speaker_wav: Optional[str] = None
-    speaker:     Optional[str] = None
+    text:     str
+    language: str           = DEFAULT_LANGUAGE
+    voice:    Optional[str] = None
 
 
 class ChunkRequest(BaseModel):
     chunks:      List[str]
     chunk_types: List[str]     = []
     language:    str           = DEFAULT_LANGUAGE
-    speaker_wav: Optional[str] = None
-    speaker:     Optional[str] = None
-
-
-class ChunkMeta(BaseModel):
-    chunk_id:     str
-    chunk_index:  int
-    chunk_type:   str
-    text:         str
-    duration_sec: float
-    latency:      dict
-    audio_b64:    Optional[str] = None
+    voice:       Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,7 +304,7 @@ class ChunkMeta(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TextChunker:
-    TONE_MAX_CHARS  = 60
+    TONE_MAX_CHARS  = 80
     LOGIC_MAX_CHARS = 200
 
     @staticmethod
@@ -212,7 +318,7 @@ class TextChunker:
         if len(sentence) <= max_chars:
             return [sentence]
         import re
-        parts  = re.split(r'(?<=[,;])\s+', sentence)
+        parts = re.split(r'(?<=[,;])\s+', sentence)
         result, current = [], ""
         for part in parts:
             if len(current) + len(part) + 1 <= max_chars:
@@ -228,349 +334,379 @@ class TextChunker:
     def split(self, text: str) -> list:
         chunks = []
         for sentence in self._sentence_split(text):
-            is_tone   = (
-                sentence.endswith("?") or sentence.endswith("!")
-                or len(sentence) <= self.TONE_MAX_CHARS
-            )
-            ctype     = ChunkType.TONE if is_tone else ChunkType.LOGIC
-            max_chars = self.TONE_MAX_CHARS if is_tone else self.LOGIC_MAX_CHARS
+            ctype     = _auto_chunk_type(sentence)
+            max_chars = self.TONE_MAX_CHARS if ctype == ChunkType.TONE else self.LOGIC_MAX_CHARS
             for sub in self._sub_split(sentence, max_chars):
                 chunks.append(AudioChunk(
-                    chunk_id    = str(uuid.uuid4())[:8],
-                    chunk_type  = ctype,
-                    text        = sub,
-                    chunk_index = len(chunks),
+                    chunk_id=str(uuid.uuid4())[:8], chunk_type=ctype,
+                    text=sub, chunk_index=len(chunks),
                 ))
         return chunks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  XTTS-v2 Engine
+#  SNAC Decoder
 # ─────────────────────────────────────────────────────────────────────────────
 
-class XTTSEngine:
+class SnacDecoder:
+    def __init__(self, device: torch.device):
+        from snac import SNAC
+        self.model  = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval().to(device)
+        self.device = device
 
-    def __init__(self, model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2"):
-        self.model_name      = model_name
-        self._tts            = None
-        self._ready          = threading.Event()
+    def warmup(self):
+        dummy = [AUDIO_OFFSET + i % SNAC_VOCAB for i in range(TPF * 7)]
+        self.decode(dummy)
+        log.info("SNAC decoder ready on %s (pre-warmed)", self.device)
+
+    @torch.inference_mode()
+    def decode(self, toks: list) -> bytes:
+        n = len(toks) // TPF
+        if n == 0:
+            return b""
+        toks  = toks[:n * TPF]
+        codes = [t - AUDIO_OFFSET for t in toks]
+        if any(c < 0 for c in codes):
+            return b""
+        l0, l1, l2 = [], [], []
+        for i in range(n):
+            b = i * TPF
+            l0.append(codes[b    ] % SNAC_VOCAB)
+            l1.append(codes[b + 1] % SNAC_VOCAB)
+            l2.append(codes[b + 2] % SNAC_VOCAB)
+            l2.append(codes[b + 3] % SNAC_VOCAB)
+            l1.append(codes[b + 4] % SNAC_VOCAB)
+            l2.append(codes[b + 5] % SNAC_VOCAB)
+            l2.append(codes[b + 6] % SNAC_VOCAB)
+        t0 = torch.tensor(l0, device=self.device).unsqueeze(0)
+        t1 = torch.tensor(l1, device=self.device).unsqueeze(0)
+        t2 = torch.tensor(l2, device=self.device).unsqueeze(0)
+        try:
+            audio = self.model.decode([t0, t1, t2]).squeeze().cpu().numpy()
+            return (np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes()
+        except Exception as exc:
+            log.debug("SNAC decode error: %s", exc)
+            return b""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Token ID Capture
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TokenIDCapture:
+    def __init__(self):
+        self.last_token: Optional[int] = None
+
+    def __call__(self, input_ids, scores):
+        if len(input_ids) > 0:
+            self.last_token = int(input_ids[-1])
+        return scores
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Orpheus GGUF Engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrpheusEngine:
+
+    def __init__(self):
+        self.hf_repo    = HF_REPO
+        self.gguf_file  = GGUF_FILENAME
+        self.gguf_path  = None
+        self.model_name = f"{HF_REPO}/{GGUF_FILENAME}"
+        self._llm       = None
+        self._tokenizer = None
+        self._snac      = None
+        self._device    = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self._ready     = threading.Event()
         self._synth_queue: queue.Queue = queue.Queue()
-        self._worker_thread  = threading.Thread(
-            target=self._worker_loop, daemon=True, name="xtts-worker"
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True, name="orpheus-worker"
         )
+
+    # ── Load ──────────────────────────────────────────────────────────────────
 
     def load(self):
-        log.info("Loading XTTS-v2: %s", self.model_name)
-        from TTS.api import TTS as CoquiTTS
-        self._tts = CoquiTTS(model_name=self.model_name, gpu=torch.cuda.is_available())
-        self._ready.set()
-        self._worker_thread.start()
-        log.info(
-            "XTTS-v2 ready.  CUDA=%s  Speakers: %s",
-            torch.cuda.is_available(),
-            self._tts.speakers[:3] if self._tts.speakers else "n/a",
+        log.info("Loading SNAC decoder on %s ...", self._device)
+        self._snac = SnacDecoder(self._device)
+        self._snac.warmup()   # warm SNAC only, not llama
+
+        log.info("Loading tokenizer: %s ...", TOKENIZER_REPO)
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_REPO)
+        log.info("Tokenizer ready.")
+
+        log.info("Resolving GGUF: %s / %s ...", self.hf_repo, self.gguf_file)
+        from huggingface_hub import hf_hub_download
+        self.gguf_path = hf_hub_download(
+            repo_id=self.hf_repo, filename=self.gguf_file, repo_type="model"
         )
+        log.info("GGUF path: %s", self.gguf_path)
+
+        log.info("Loading GGUF (n_gpu_layers=%d, n_ctx=%d, n_batch=%d) ...",
+                 N_GPU_LAYERS, N_CTX, N_BATCH)
+        from llama_cpp import Llama
+        self._llm = Llama(
+            model_path   = self.gguf_path,
+            n_gpu_layers = N_GPU_LAYERS,
+            n_ctx        = N_CTX,
+            n_batch      = N_BATCH,
+            n_threads    = N_THREADS,
+            verbose      = False,
+        )
+        log.info("GGUF model loaded.")
+        self._worker_thread.start()
+        self._ready.set()
+        log.info("OrpheusEngine ready. CUDA=%s device=%s voice=%s quant=%s",
+                 torch.cuda.is_available(), self._device, ORPHEUS_VOICE, self.gguf_file)
+
+    def prewarm_bg(self):
+        """
+        v5.4: pre-warm runs in its own thread, NOT via _synth_queue.
+        Real requests are never blocked by this.
+        """
+        def _run():
+            try:
+                log.info("Pre-warm (background): warming llama + SNAC ...")
+                t0   = time.time()
+                v    = ORPHEUS_VOICE
+                text = "Hello."
+                ids  = self._tokenizer.encode(f"{v}: {text}", add_special_tokens=False)
+                pids = [SOH_ID] + ids + [EOT_ID, EOH_ID]
+                buf  = []
+                for out in self._llm(pids, max_tokens=80, temperature=TEMPERATURE,
+                                     top_p=TOP_P, stream=True):
+                    frag = out["choices"][0].get("text", "")
+                    if frag:
+                        fids = self._tokenizer.encode(frag, add_special_tokens=False)
+                        for tid in fids:
+                            if tid >= AUDIO_OFFSET:
+                                buf.append(tid)
+                        if len(buf) >= TPF * 3:
+                            self._snac.decode(buf)
+                            break
+                log.info("Pre-warm done in %.0fms", (time.time() - t0) * 1000)
+            except Exception as exc:
+                log.warning("Pre-warm failed (non-fatal): %s", exc)
+
+        threading.Thread(target=_run, daemon=True, name="prewarm").start()
+
+    # ── Worker thread ─────────────────────────────────────────────────────────
 
     def _worker_loop(self):
         while True:
             item = self._synth_queue.get()
             if item is None:
                 break
-            chunk, speaker_wav, speaker, language, job, result_event = item
+            text, voice, pcm_queue, cancel_evt = item
             try:
-                chunk.latency.synth_start_ts = time.time()
-                audio = self._synthesize_sync(chunk.text, speaker_wav, speaker, language)
-                chunk.latency.synth_end_ts   = time.time()
-
-                job.record_first_chunk(chunk.latency.synth_end_ts)
-                chunk.latency.first_chunk_ready_ts = job.first_chunk_ready_ts
-                chunk.latency.job_start_ts         = job.start_ts
-                chunk.latency.compute()
-
-                chunk.audio        = audio
-                chunk.duration_sec = len(audio) / SAMPLE_RATE
-                chunk.ready        = True
-
-                log.info(
-                    "Chunk %s [%s] idx=%d | synth=%.0fms | from_job=%.0fms | dur=%.2fs",
-                    chunk.chunk_id, chunk.chunk_type, chunk.chunk_index,
-                    chunk.latency.synth_duration_ms,
-                    chunk.latency.synthesis_latency_ms,
-                    chunk.duration_sec,
-                )
+                self._synthesize_sync(text, voice, pcm_queue, cancel_evt)
             except Exception as exc:
-                log.error("Synthesis error chunk %s: %s", chunk.chunk_id, exc)
-                chunk.error = str(exc)
-                chunk.ready = True
+                log.error("Worker synthesis error: %s", exc)
+                _stats.record_error()
             finally:
-                result_event.set()
+                pcm_queue.put(None)
                 self._synth_queue.task_done()
+
+    # ── Core synthesis ────────────────────────────────────────────────────────
 
     def _synthesize_sync(
         self,
-        text:        str,
-        speaker_wav: Optional[str],
-        speaker:     Optional[str],
-        language:    str,
-    ) -> np.ndarray:
-        self._ready.wait()
-        wav = speaker_wav or DEFAULT_SPEAKER_WAV
-        spk = speaker or (DEFAULT_SPEAKER if not wav else None)
-        kwargs: dict = {"text": text, "language": language}
-        if wav:
-            kwargs["speaker_wav"] = wav
-        else:
-            kwargs["speaker"] = spk
-        result = self._tts.tts(**kwargs)
-        return np.array(result, dtype=np.float32)
+        text:       str,
+        voice:      str,
+        pcm_queue:  queue.Queue,
+        cancel_evt: threading.Event,
+    ):
+        v          = voice if voice in ORPHEUS_VOICES else ORPHEUS_VOICE
+        ids        = self._tokenizer.encode(f"{v}: {text}", add_special_tokens=False)
+        prompt_ids = [SOH_ID] + ids + [EOT_ID, EOH_ID]
 
-    async def synthesize_chunk(
+        capture = _TokenIDCapture()
+        use_lp  = False
+        try:
+            from llama_cpp import LogitsProcessorList
+            lp_list = LogitsProcessorList([capture])
+            use_lp  = True
+        except ImportError:
+            pass
+
+        gen_kwargs: dict = dict(
+            max_tokens     = MAX_TOKENS,
+            temperature    = TEMPERATURE,
+            top_p          = TOP_P,
+            repeat_penalty = REPETITION_PENALTY,
+            stream         = True,
+        )
+        if use_lp:
+            gen_kwargs["logits_processor"] = lp_list
+
+        buf         = []
+        in_audio    = False
+        yielded     = 0
+        done        = False
+        empty_count = 0
+
+        for output in self._llm(prompt_ids, **gen_kwargs):
+            if done or cancel_evt.is_set():
+                break
+
+            text_frag     = output["choices"][0].get("text", "")
+            finish_reason = output["choices"][0].get("finish_reason")
+
+            if use_lp and capture.last_token is not None:
+                tok_id = capture.last_token
+                capture.last_token = None
+            else:
+                if not text_frag:
+                    if finish_reason:
+                        break
+                    continue
+                frag_ids = self._tokenizer.encode(text_frag, add_special_tokens=False)
+                if not frag_ids:
+                    continue
+                tok_id = frag_ids[-1]
+
+            if tok_id in END_TOKENS or finish_reason:
+                done = True
+                break
+            if tok_id == START_TOKEN:
+                in_audio = True
+                continue
+            if not in_audio:
+                continue
+
+            if tok_id >= AUDIO_OFFSET:
+                buf.append(tok_id)
+
+                # v5.4 FIX: flush check ONLY when audio token was just appended
+                target = (INIT_FRAMES if yielded == 0 else STREAM_FRAMES) * TPF
+                if len(buf) >= target:
+                    n   = (len(buf) // TPF) * TPF
+                    pcm = self._snac.decode(buf[:n])
+                    buf = buf[n:]
+                    if pcm:
+                        empty_count = 0
+                        if not cancel_evt.is_set():
+                            pcm_queue.put(pcm)
+                            yielded += n // TPF
+                    else:
+                        empty_count += 1
+                        if empty_count >= MAX_EMPTY_SNAC:
+                            log.warning("SNAC empty %d× — skipping chunk", empty_count)
+                            break
+
+        # Flush leftover
+        if buf and not cancel_evt.is_set():
+            n = (len(buf) // TPF) * TPF
+            if n:
+                pcm = self._snac.decode(buf[:n])
+                if pcm:
+                    pcm_queue.put(pcm)
+
+    # ── Async streaming ───────────────────────────────────────────────────────
+
+    async def synthesize_chunk_streaming(
         self,
-        chunk:       AudioChunk,
-        speaker_wav: Optional[str],
-        speaker:     Optional[str],
-        language:    str,
-        job:         SynthesisJob,
-    ) -> AudioChunk:
-        result_event = threading.Event()
-        self._synth_queue.put((chunk, speaker_wav, speaker, language, job, result_event))
-        await asyncio.get_event_loop().run_in_executor(None, result_event.wait)
-        return chunk
-
-    async def synthesize_stream(self, job: SynthesisJob) -> AsyncGenerator[AudioChunk, None]:
-        chunks = job.chunks
-        if not chunks:
+        chunk:      AudioChunk,
+        voice:      Optional[str],
+        job:        SynthesisJob,
+        cancel_evt: Optional[threading.Event] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        if job.cancelled:
             return
 
-        pending     = []
-        chunk_index = 0
+        v      = voice if voice and voice in ORPHEUS_VOICES else ORPHEUS_VOICE
+        pcm_q  = queue.Queue()
+        _cevt  = cancel_evt if cancel_evt is not None else threading.Event()
 
-        async def _enqueue_next():
-            nonlocal chunk_index
-            if chunk_index < len(chunks):
-                ch = chunks[chunk_index]
-                chunk_index += 1
-                task = asyncio.create_task(
-                    self.synthesize_chunk(ch, job.speaker_wav, job.speaker, job.language, job)
-                )
-                pending.append(task)
+        chunk.latency.synth_start_ts = time.time()
+        chunk.latency.job_start_ts   = job.start_ts
+        self._synth_queue.put((chunk.text, v, pcm_q, _cevt))
 
-        for _ in range(min(PRE_BUFFER_CHUNKS, len(chunks))):
-            await _enqueue_next()
+        loop      = asyncio.get_event_loop()
+        raw_parts: list = []
 
-        while pending:
+        try:
+            while True:
+                if job.cancelled or _cevt.is_set():
+                    _cevt.set()
+                    break
+                try:
+                    raw = await loop.run_in_executor(
+                        None, lambda: pcm_q.get(timeout=120.0)
+                    )
+                except queue.Empty:
+                    log.warning("Synthesis timeout [%s...]", chunk.text[:30])
+                    _cevt.set()
+                    break
+
+                if raw is None:
+                    break
+
+                raw_parts.append(raw)
+                if len(raw_parts) == 1:
+                    job.record_first_chunk(time.time())
+
+                yield raw
+
+        except asyncio.CancelledError:
+            _cevt.set()
+            raise
+        except Exception as exc:
+            _cevt.set()
+            log.error("synthesize_chunk_streaming: %s", exc)
+            chunk.error = str(exc)
+        finally:
+            _cevt.set()
+
+        chunk.latency.synth_end_ts         = time.time()
+        chunk.latency.first_chunk_ready_ts = job.first_chunk_ready_ts
+        chunk.latency.compute()
+
+        if raw_parts:
+            all_bytes          = b"".join(raw_parts)
+            chunk.audio        = np.frombuffer(all_bytes, dtype=np.int16).astype(np.float32) / 32767.0
+            chunk.duration_sec = len(chunk.audio) / SAMPLE_RATE
+            _stats.record(v, chunk.latency.first_chunk_latency_ms, len(chunk.text))
+        else:
+            chunk.audio        = np.zeros(0, dtype=np.float32)
+            chunk.duration_sec = 0.0
+            chunk.error        = chunk.error or "empty audio"
+            _stats.record_error()
+
+        chunk.ready = True
+        log.info("Chunk %s [%s] idx=%d | synth=%.0fms | job=%.0fms | dur=%.2fs",
+                 chunk.chunk_id, chunk.chunk_type, chunk.chunk_index,
+                 chunk.latency.synth_duration_ms,
+                 chunk.latency.synthesis_latency_ms,
+                 chunk.duration_sec)
+
+    async def synthesize_chunk(self, chunk, voice, job):
+        async for _ in self.synthesize_chunk_streaming(chunk, voice, job):
+            pass
+        return chunk
+
+    async def synthesize_stream(self, job):
+        """
+        v5.4: yields (chunk, raw_pcm_bytes) as PCM arrives.
+        Caller gets bytes immediately — no waiting for full chunk.
+        """
+        for ch in job.chunks:
             if job.cancelled:
-                for t in pending:
-                    t.cancel()
                 break
-            done_chunk = await pending.pop(0)
-            await _enqueue_next()
-            if done_chunk.error:
-                log.warning("Skipping chunk %s: %s", done_chunk.chunk_id, done_chunk.error)
-                continue
-            yield done_chunk
+            async for raw in self.synthesize_chunk_streaming(ch, job.voice, job):
+                yield ch, raw
+            if ch.error:
+                log.warning("Chunk %s error: %s", ch.chunk_id, ch.error)
 
     def shutdown(self):
         self._synth_queue.put(None)
-        self._worker_thread.join(timeout=5)
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Shared Audio Helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample a float32 mono array. Uses scipy if available, else linear interp."""
-    if orig_sr == target_sr:
-        return audio
-    try:
-        from math import gcd
-        from scipy.signal import resample_poly
-        g = gcd(orig_sr, target_sr)
-        return resample_poly(audio, target_sr // g, orig_sr // g).astype(np.float32)
-    except ImportError:
-        n_out = int(len(audio) * target_sr / orig_sr)
-        return np.interp(
-            np.linspace(0, 1, n_out),
-            np.linspace(0, 1, len(audio)),
-            audio,
-        ).astype(np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Background TTS Self-Enrollment
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TTSEnrollmentManager:
-    """
-    At startup (after XTTS-v2 loads) this manager automatically:
-
-      1. Synthesizes ENROLLMENT_TEXT with the configured TTS voice.
-      2. Resamples 24 kHz → 16 kHz  (STT pipeline runs at 16 kHz).
-      3. Converts float32 PCM → int16 raw bytes, encodes as base64.
-      4. POSTs to  POST {STT_ENROLL_URL}  with payload:
-             { "pcm_b64": "...", "sample_rate": 16000, "commit": true }
-      5. STT calls pipeline.push_ai_reference() + pipeline.commit_tts_enrollment().
-      6. STT locks the TTS voice profile → future TTS echo is silently suppressed.
-
-    The user never hears or sees this — it runs completely in the background.
-    If STT is not yet up, enrollment retries every ENROLL_RETRY_S seconds.
-
-    Public state (read by /enrollment_status)
-    ──────────────────────────────────────────
-      enrolled : bool          True once STT confirmed the profile is locked
-      progress : float 0–1     synthesis fraction completed
-      retries  : int           attempts so far
-      error    : str | None    last failure reason
-    """
-
-    def __init__(self, engine: XTTSEngine):
-        self._engine    = engine
-        self.enrolled   = False
-        self.progress   = 0.0
-        self.retries    = 0
-        self.error: Optional[str] = None
-        self._lock      = asyncio.Lock()
-
-    # ── Startup entrypoint ────────────────────────────────────────────────────
-
-    async def run_background(self):
-        """Called once as an asyncio background task at app startup."""
-        log.info("[enroll] Waiting for XTTS-v2 to finish loading…")
-        while not self._engine._ready.is_set():
-            await asyncio.sleep(0.5)
-
-        log.info(
-            "[enroll] XTTS-v2 ready — starting voice enrollment\n"
-            "[enroll] Text (%d chars): %r\n"
-            "[enroll] Target STT URL : %s",
-            len(ENROLLMENT_TEXT), ENROLLMENT_TEXT[:80], STT_ENROLL_URL,
-        )
-
-        for attempt in range(1, ENROLL_MAX_RETRIES + 1):
-            self.retries = attempt
-            try:
-                await self._do_enroll()
-                self.enrolled = True
-                self.progress = 1.0
-                log.info("[enroll] ✅ STT voice profile locked (attempt %d)", attempt)
-                return
-            except Exception as exc:
-                self.error = str(exc)
-                log.warning(
-                    "[enroll] Attempt %d/%d failed: %s — retry in %.1fs",
-                    attempt, ENROLL_MAX_RETRIES, exc, ENROLL_RETRY_S,
-                )
-                if attempt < ENROLL_MAX_RETRIES:
-                    await asyncio.sleep(ENROLL_RETRY_S)
-
-        log.error(
-            "[enroll] ❌ All %d attempts failed — STT will run without TTS echo suppression.",
-            ENROLL_MAX_RETRIES,
-        )
-
-    # ── Re-enrollment (after voice change) ───────────────────────────────────
-
-    async def re_enroll(self):
-        """
-        Re-run enrollment after a voice/speaker change.
-        Resets the STT-side voice profile, then re-synthesizes and re-posts.
-        """
-        async with self._lock:
-            self.enrolled = False
-            self.progress = 0.0
-            self.error    = None
-            self.retries  = 0
-
-            # Tell STT to wipe the existing profile first
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.delete(STT_RESET_URL)
-                    resp.raise_for_status()
-                log.info("[enroll] STT enrollment reset acknowledged")
-            except Exception as exc:
-                log.warning("[enroll] STT reset failed (non-fatal): %s", exc)
-
-            await self.run_background()
-
-    # ── Core enrollment logic ─────────────────────────────────────────────────
-
-    async def _do_enroll(self):
-        """
-        Synthesize the enrollment phrase, resample to 16 kHz,
-        convert to PCM16, and POST to the STT /enroll_tts endpoint.
-        """
-        # ── 1. Synthesize enrollment phrase ──────────────────────────────────
-        log.info("[enroll] Synthesizing enrollment audio…")
-        chunker_local = TextChunker()
-        chunks        = chunker_local.split(ENROLLMENT_TEXT)
-        job           = SynthesisJob(
-            job_id      = "enroll-" + str(uuid.uuid4())[:8],
-            text        = ENROLLMENT_TEXT,
-            language    = DEFAULT_LANGUAGE,
-            speaker_wav = DEFAULT_SPEAKER_WAV,
-            speaker     = DEFAULT_SPEAKER,
-            chunks      = chunks,
-        )
-
-        audio_parts: list[np.ndarray] = []
-        total = len(chunks)
-
-        async for chunk in self._engine.synthesize_stream(job):
-            audio_parts.append(chunk.audio)
-            self.progress = len(audio_parts) / total
-            log.info(
-                "[enroll] chunk %d/%d  %.2fs  (cumulative %.2fs)",
-                len(audio_parts), total, chunk.duration_sec,
-                sum(c.shape[0] for c in audio_parts) / SAMPLE_RATE,
-            )
-
-        if not audio_parts:
-            raise RuntimeError("TTS synthesis produced no audio for enrollment")
-
-        audio_24k = np.concatenate(audio_parts).astype(np.float32)
-        log.info("[enroll] Synthesis complete — %.2fs at %d Hz",
-                 len(audio_24k) / SAMPLE_RATE, SAMPLE_RATE)
-
-        # ── 2. Resample 24 kHz → 16 kHz ──────────────────────────────────────
-        audio_16k = _resample(audio_24k, orig_sr=SAMPLE_RATE, target_sr=ENROLL_TARGET_SR)
-        log.info("[enroll] Resampled to %d Hz — %d samples", ENROLL_TARGET_SR, len(audio_16k))
-
-        # ── 3. Convert float32 → int16 → base64 ──────────────────────────────
-        pcm16     = (np.clip(audio_16k, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        pcm_b64   = base64.b64encode(pcm16).decode()
-        log.info("[enroll] PCM16 encoded — %d bytes → base64 %.1f KB",
-                 len(pcm16), len(pcm_b64) / 1024)
-
-        # ── 4. POST to STT /enroll_tts (fire-and-forget) ─────────────────────
-        # STT receives the audio for its own context — but enrollment success
-        # is determined by TTS synthesis completing, not STT's response.
-        payload = {
-            "pcm_b64":     pcm_b64,
-            "sample_rate": ENROLL_TARGET_SR,
-            "commit":      True,
-        }
-        log.info("[enroll] POSTing to %s …", STT_ENROLL_URL)
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(STT_ENROLL_URL, json=payload)
-                resp.raise_for_status()
-                result = resp.json()
-            log.info("[enroll] STT response: %s", result)
-        except Exception as stt_exc:
-            log.warning("[enroll] STT POST failed (non-fatal): %s", stt_exc)
-
-        # ── 5. Enrollment success = synthesis audio was produced ──────────────
-        # The gateway gate is fed live via feed_tts() during every TTS playback.
-        # No STT confirmation needed — mark enrolled as soon as audio is ready.
-        log.info(
-            "[enroll] ✅ Voice enrolled — %.2fs of audio synthesized and ready",
-            len(audio_16k) / ENROLL_TARGET_SR,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Chunk Audio Display (ASCII waveform helper)
+#  Chunk Audio Display
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChunkAudioDisplay:
@@ -582,15 +718,15 @@ class ChunkAudioDisplay:
     def waveform(cls, audio: np.ndarray, width: int = WIDTH, height: int = HEIGHT) -> str:
         if audio is None or len(audio) == 0:
             return "[no audio]"
-        step = max(1, len(audio) // width)
-        cols = []
+        step    = max(1, len(audio) // width)
+        cols    = []
         for i in range(0, len(audio), step):
             cols.append(float(np.sqrt(np.mean(audio[i:i+step] ** 2))))
             if len(cols) == width:
                 break
         max_val = max(cols) if cols else 1.0
         norm    = [v / (max_val or 1.0) for v in cols]
-        rows = []
+        rows    = []
         for row in range(height, 0, -1):
             thr = row / height
             rows.append("|" + "".join(cls.BAR_CHAR if v >= thr else " " for v in norm) + "|")
@@ -600,7 +736,7 @@ class ChunkAudioDisplay:
     @classmethod
     def display_chunk(cls, chunk: AudioChunk) -> str:
         lat = chunk.latency
-        lines = [
+        return "\n".join([
             f"{'─'*68}",
             f"  Chunk #{chunk.chunk_index}  id={chunk.chunk_id}  type={chunk.chunk_type}",
             f"  Text : {chunk.text[:80]}",
@@ -609,17 +745,12 @@ class ChunkAudioDisplay:
             f"    • synth duration          : {lat.synth_duration_ms:>8.1f} ms",
             f"    • since job start         : {lat.synthesis_latency_ms:>8.1f} ms",
             f"    • since first chunk ready : {lat.first_chunk_latency_ms:>8.1f} ms",
-        ]
-        if chunk.audio is not None:
-            lines.append("  Waveform:")
-            for wl in cls.waveform(chunk.audio).split("\n"):
-                lines.append(f"    {wl}")
-        return "\n".join(lines)
+        ])
 
     @classmethod
     def display_job(cls, chunks: list) -> str:
         parts = [f"\n{'═'*68}", "  CHUNK AUDIO REPORT", f"{'═'*68}"]
-        cum = 0.0
+        cum   = 0.0
         for c in chunks:
             parts.append(cls.display_chunk(c))
             parts.append(
@@ -638,10 +769,8 @@ class ChunkAudioDisplay:
 def float32_to_pcm16(audio: np.ndarray) -> bytes:
     return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
-
 def audio_to_wav_bytes(audio: np.ndarray) -> bytes:
     return build_wav_header(len(audio)) + float32_to_pcm16(audio)
-
 
 def build_wav_header(
     num_samples:     int = 0,
@@ -666,46 +795,47 @@ def build_wav_header(
     hdr += b"data" + struct.pack("<I", data_size)
     return hdr
 
-
 def chunk_to_meta(chunk: AudioChunk, include_audio: bool = False) -> dict:
     meta: dict = {
-        "chunk_id":    chunk.chunk_id,
-        "chunk_index": chunk.chunk_index,
-        "chunk_type":  chunk.chunk_type,
-        "text":        chunk.text,
+        "chunk_id":     chunk.chunk_id,
+        "chunk_index":  chunk.chunk_index,
+        "chunk_type":   chunk.chunk_type,
+        "text":         chunk.text,
         "duration_sec": round(chunk.duration_sec, 4),
-        "latency":     chunk.latency.to_dict(),
+        "latency":      chunk.latency.to_dict(),
     }
     if include_audio and chunk.audio is not None:
         meta["audio_b64"]     = base64.b64encode(audio_to_wav_bytes(chunk.audio)).decode()
         meta["audio_samples"] = len(chunk.audio)
     return meta
 
+def _resolve_voice(requested: Optional[str]) -> str:
+    if requested and requested in ORPHEUS_VOICES:
+        return requested
+    return ORPHEUS_VOICE
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FastAPI App
 # ─────────────────────────────────────────────────────────────────────────────
 
-app         = FastAPI(title="XTTS-v2 TTS Microservice", version="3.0.0")
-engine      = XTTSEngine()
+engine      = OrpheusEngine()
 chunker     = TextChunker()
 active_jobs: dict = {}
-enrollment  = TTSEnrollmentManager(engine)
+_AUDIO_HEADERS = {"X-Sample-Rate": str(SAMPLE_RATE), "X-Encoding": "pcm16"}
 
 
-@app.on_event("startup")
-async def _startup():
-    # Load XTTS-v2 in a thread so we don't block the event loop
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, engine.load)
-    # Fire enrollment in background — does NOT block app startup
-    asyncio.create_task(enrollment.run_background())
-    log.info("TTS service v3.0 started — background enrollment task launched")
-
-
-@app.on_event("shutdown")
-def _shutdown():
+    log.info("TTS service v5.4 started")
+    engine.prewarm_bg()   # background only — never blocks real requests
+    yield
     engine.shutdown()
+
+
+app = FastAPI(title="Orpheus TTS Microservice", version="5.4.0", lifespan=lifespan)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -713,61 +843,34 @@ def _shutdown():
 @app.get("/health")
 def health():
     return {
-        "status":          "ok",
-        "version":         "3.0.0",
-        "cuda":            torch.cuda.is_available(),
-        "model":           engine.model_name,
-        "default_speaker": DEFAULT_SPEAKER,
-        "tts_enrolled":    enrollment.enrolled,
-        "enroll_progress": round(enrollment.progress, 2),
+        "status":        "ok",
+        "version":       "5.4.0",
+        "engine":        "orpheus-gguf-llama-cpp",
+        "hf_repo":       engine.hf_repo,
+        "gguf_file":     engine.gguf_file,
+        "gguf_path":     str(engine.gguf_path),
+        "tokenizer":     TOKENIZER_REPO,
+        "cuda":          torch.cuda.is_available(),
+        "n_gpu_layers":  N_GPU_LAYERS,
+        "n_ctx":         N_CTX,
+        "n_batch":       N_BATCH,
+        "default_voice": ORPHEUS_VOICE,
+        "voices":        sorted(ORPHEUS_VOICES),
+        "latency_stats": _stats.summary(),
     }
 
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics():
+    return _stats.prometheus()
 
-# ── Enrollment status ─────────────────────────────────────────────────────────
-
-@app.get("/enrollment_status")
-def enrollment_status():
-    """
-    Poll this from the gateway before starting the first user session.
-    Returns immediately — non-blocking.
-
-    Response:
-      enrolled  bool    True = STT has the TTS voice profile locked
-      progress  float   0.0 → 1.0 as synthesis chunks complete
-      retries   int     how many POST attempts have been made
-      error     str     last error if enrollment has failed
-      stt_url   str     which STT endpoint is targeted
-    """
-    return {
-        "enrolled":  enrollment.enrolled,
-        "progress":  round(enrollment.progress, 2),
-        "retries":   enrollment.retries,
-        "error":     enrollment.error,
-        "stt_url":   STT_ENROLL_URL,
-    }
-
-
-# ── Re-enrollment trigger ─────────────────────────────────────────────────────
-
-@app.post("/enroll_tts")
-async def trigger_reenrollment():
-    """
-    Trigger re-enrollment after a voice/speaker change.
-    Resets the STT voice profile and re-enrolls with the current speaker.
-    Runs in the background — returns immediately.
-    """
-    asyncio.create_task(enrollment.re_enroll())
-    return {"status": "re-enrollment started", "enrolled": False}
-
-
-@app.delete("/enrollment")
-def reset_enrollment_local():
-    """Reset local enrollment state only (does not touch STT). For testing."""
-    enrollment.enrolled = False
-    enrollment.progress = 0.0
-    enrollment.error    = None
-    enrollment.retries  = 0
-    return {"status": "local enrollment state reset"}
+@app.get("/tts/voices")
+def list_voices():
+    stats = _stats.summary()
+    return {"voices": [
+        {"voice": v, "default": v == ORPHEUS_VOICE,
+         **({"latency": stats["voices"][v]} if v in stats["voices"] else {})}
+        for v in sorted(ORPHEUS_VOICES)
+    ]}
 
 
 # ── REST: streaming WAV ───────────────────────────────────────────────────────
@@ -778,22 +881,23 @@ async def tts_stream(req: TTSRequest):
     chunks = chunker.split(req.text)
     job    = SynthesisJob(
         job_id=job_id, text=req.text, language=req.language,
-        speaker_wav=req.speaker_wav, speaker=req.speaker, chunks=chunks,
+        voice=_resolve_voice(req.voice), chunks=chunks,
     )
     active_jobs[job_id] = job
-    all_chunks: list = []
+    seen: set = set()
 
     async def generate():
         yield build_wav_header(num_samples=0)
-        async for chunk in engine.synthesize_stream(job):
-            all_chunks.append(chunk)
-            yield float32_to_pcm16(chunk.audio)
+        async for ch, raw in engine.synthesize_stream(job):
+            seen.add(ch.chunk_id)
+            yield raw
         active_jobs.pop(job_id, None)
-        log.info(ChunkAudioDisplay.display_job(all_chunks))
+        log.info(ChunkAudioDisplay.display_job([c for c in chunks if c.chunk_id in seen]))
 
     return StreamingResponse(
-        generate(), media_type="audio/wav",
-        headers={"X-Job-Id": job_id, "X-Chunk-Count": str(len(chunks))},
+        generate(),
+        media_type="audio/wav",
+        headers={**_AUDIO_HEADERS, "X-Job-Id": job_id, "X-Chunk-Count": str(len(chunks))},
     )
 
 
@@ -804,25 +908,28 @@ async def tts_full(req: TTSRequest):
     chunks = chunker.split(req.text)
     job    = SynthesisJob(
         job_id=str(uuid.uuid4()), text=req.text, language=req.language,
-        speaker_wav=req.speaker_wav, speaker=req.speaker, chunks=chunks,
+        voice=_resolve_voice(req.voice), chunks=chunks,
     )
-    all_audio, all_chunks = [], []
-    async for chunk in engine.synthesize_stream(job):
-        all_audio.append(chunk.audio)
-        all_chunks.append(chunk)
+    all_audio, done_chunks, seen = [], [], set()
+    async for ch, _ in engine.synthesize_stream(job):
+        if ch.chunk_id not in seen and ch.audio is not None and len(ch.audio):
+            seen.add(ch.chunk_id)
+            all_audio.append(ch.audio)
+            done_chunks.append(ch)
 
     if not all_audio:
         raise HTTPException(status_code=500, detail="Synthesis produced no audio")
 
-    log.info(ChunkAudioDisplay.display_job(all_chunks))
+    log.info(ChunkAudioDisplay.display_job(done_chunks))
     combined  = np.concatenate(all_audio)
     wav_bytes = audio_to_wav_bytes(combined)
     return StreamingResponse(
         io.BytesIO(wav_bytes), media_type="audio/wav",
         headers={
+            **_AUDIO_HEADERS,
             "Content-Length": str(len(wav_bytes)),
-            "X-Chunk-Count":  str(len(all_chunks)),
-            "X-Chunk-Meta":   json.dumps([chunk_to_meta(c) for c in all_chunks]),
+            "X-Chunk-Count":  str(len(done_chunks)),
+            "X-Chunk-Meta":   json.dumps([chunk_to_meta(c) for c in done_chunks]),
         },
     )
 
@@ -833,97 +940,190 @@ async def tts_full(req: TTSRequest):
 async def tts_chunks(req: ChunkRequest):
     audio_chunks = []
     for i, text in enumerate(req.chunks):
-        ctype_str = req.chunk_types[i] if i < len(req.chunk_types) else "logic"
-        try:
-            ctype = ChunkType(ctype_str)
-        except ValueError:
-            ctype = ChunkType.LOGIC
+        hint = req.chunk_types[i] if i < len(req.chunk_types) else "auto"
+        if hint in ("auto", "") or hint not in ("tone", "logic"):
+            ctype = _auto_chunk_type(text)
+        else:
+            ctype = ChunkType(hint)
         audio_chunks.append(AudioChunk(
-            chunk_id=str(uuid.uuid4())[:8], chunk_type=ctype, text=text, chunk_index=i,
+            chunk_id=str(uuid.uuid4())[:8], chunk_type=ctype,
+            text=text, chunk_index=i,
         ))
     job = SynthesisJob(
         job_id=str(uuid.uuid4()), text=" ".join(req.chunks), language=req.language,
-        speaker_wav=req.speaker_wav, speaker=req.speaker, chunks=audio_chunks,
+        voice=_resolve_voice(req.voice), chunks=audio_chunks,
     )
-    results = []
-    async for chunk in engine.synthesize_stream(job):
-        meta = chunk_to_meta(chunk, include_audio=True)
-        meta["display_waveform"] = ChunkAudioDisplay.waveform(chunk.audio)
-        meta["display_report"]   = ChunkAudioDisplay.display_chunk(chunk)
-        results.append(meta)
+    results, seen = [], set()
+    async for ch, _ in engine.synthesize_stream(job):
+        if ch.chunk_id not in seen and ch.ready:
+            seen.add(ch.chunk_id)
+            meta = chunk_to_meta(ch, include_audio=True)
+            meta["display_waveform"] = ChunkAudioDisplay.waveform(ch.audio)
+            meta["display_report"]   = ChunkAudioDisplay.display_chunk(ch)
+            results.append(meta)
     log.info(ChunkAudioDisplay.display_job([c for c in audio_chunks if c.ready]))
     return {"total_chunks": len(results), "chunks": results}
 
 
-# ── WebSocket: real-time duplex ───────────────────────────────────────────────
+# ── WebSocket: PERSISTENT SESSION ────────────────────────────────────────────
 
-@app.websocket("/ws/tts")
-async def ws_tts(websocket: WebSocket):
+async def _ws_tts_session(websocket: WebSocket):
     """
-    WebSocket TTS endpoint.
+    v5.4 PERSISTENT SESSION — one WS connection per AI turn.
 
-    Client → Server (JSON):
-        { "text": "...", "language": "en", "speaker_wav": null,
-          "speaker": null, "chunk_tone": "tone"|"logic" }
+    The gateway sends sentences one at a time over the SAME connection.
+    This keeps llama context warm → natural gapless speech, no cold-start
+    penalty per sentence.
 
-    Server → Client:
-        Frame 1   : binary WAV header (44 bytes)
-        Frame 2–N : alternating JSON chunk_meta + binary PCM16 per chunk
-        Final     : binary b""  (end-of-stream signal)
+    Per-request flow:
+      1. Gateway → JSON { "text":"...", "voice":"tara", "chunk_tone":"auto" }
+      2. Server  → binary WAV header (44 bytes)
+      3. Server  → binary PCM chunks (int16, streamed live as generated)
+      4. Server  → JSON { "type":"chunk_meta", "data":{...} }
+      5. Server  → binary b""   ← END-OF-REQUEST sentinel
+         (gateway can now send next JSON immediately)
+
+    Control messages (gateway may send at any time):
+      { "type":"cancel" }  → abort current synthesis, server resets for next
+      { "type":"close" }   → graceful session end
+      { "type":"ping" }    → server replies { "type":"pong" }
+
+    Server sends { "type":"ping" } every 15s to keep NAT/proxies alive.
     """
     await websocket.accept()
-    log.info("WS connected: %s", websocket.client)
+    conn_id        = f"{websocket.client.host}:{websocket.client.port}"
+    session_cancel = threading.Event()
     active_job: Optional[SynthesisJob] = None
+
+    log.info("WS session opened: %s", conn_id)
+
+    async def _heartbeat():
+        while True:
+            await asyncio.sleep(WS_HEARTBEAT_INTERVAL)
+            try:
+                await websocket.send_json({"type": "ping"})
+            except Exception:
+                break
+
+    hb_task = asyncio.create_task(_heartbeat())
 
     try:
         while True:
-            data = await websocket.receive_json()
-            text = data.get("text", "").strip()
-            if not text:
-                await websocket.send_json({"error": "empty text"})
+            try:
+                raw_msg = await asyncio.wait_for(websocket.receive(), timeout=120.0)
+            except asyncio.TimeoutError:
+                log.info("WS session idle 120s — closing: %s", conn_id)
+                break
+
+            if raw_msg.get("bytes") is not None:
+                continue  # ignore unexpected binary from client
+
+            text_msg = raw_msg.get("text", "")
+            if not text_msg:
                 continue
 
-            if active_job:
-                active_job.cancelled = True
+            try:
+                data = json.loads(text_msg)
+            except json.JSONDecodeError:
+                continue
 
-            chunk_tone   = data.get("chunk_tone", "logic")
-            ctype        = ChunkType.TONE if chunk_tone == "tone" else ChunkType.LOGIC
+            msg_type = data.get("type", "")
+
+            # ── Control ───────────────────────────────────────────────────────
+            if msg_type == "close":
+                log.info("WS close requested: %s", conn_id)
+                break
+
+            if msg_type == "cancel":
+                session_cancel.set()
+                if active_job:
+                    active_job.cancelled = True
+                active_job = None
+                session_cancel.clear()
+                log.info("WS cancel applied: %s", conn_id)
+                continue
+
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            # ── Synthesis ─────────────────────────────────────────────────────
+            text = data.get("text", "").strip()
+            if not text:
+                await websocket.send_json({"type": "error", "detail": "empty text"})
+                continue
+
+            voice = _resolve_voice(data.get("voice"))
+
+            # Always auto-detect — gateway hint is unreliable
+            hint  = data.get("chunk_tone", "auto")
+            ctype = _auto_chunk_type(text) if hint not in ("tone", "logic") else ChunkType(hint)
+
             single_chunk = AudioChunk(
-                chunk_id=str(uuid.uuid4())[:8], chunk_type=ctype, text=text, chunk_index=0,
+                chunk_id=str(uuid.uuid4())[:8], chunk_type=ctype,
+                text=text, chunk_index=0,
             )
             active_job = SynthesisJob(
-                job_id=str(uuid.uuid4()), text=text,
-                language=data.get("language", DEFAULT_LANGUAGE),
-                speaker_wav=data.get("speaker_wav"),
-                speaker=data.get("speaker"),
-                chunks=[single_chunk],
+                job_id   = str(uuid.uuid4()),
+                text     = text,
+                language = data.get("language", DEFAULT_LANGUAGE),
+                voice    = voice,
+                chunks   = [single_chunk],
             )
+            session_cancel.clear()
 
-            log.info("WS TTS: tone=%s  len=%d  text=%r", chunk_tone, len(text), text[:60])
+            log.info("WS synth: %s voice=%s len=%d text=%r",
+                     ctype, voice, len(text), text[:60])
+
             await websocket.send_bytes(build_wav_header(num_samples=0))
 
-            all_chunks = []
-            async for chunk in engine.synthesize_stream(active_job):
-                all_chunks.append(chunk)
+            async for raw_pcm in engine.synthesize_chunk_streaming(
+                single_chunk, voice, active_job, cancel_evt=session_cancel
+            ):
+                await websocket.send_bytes(raw_pcm)
+
+            if single_chunk.ready:
                 await websocket.send_json({
                     "type":       "chunk_meta",
-                    "data":       chunk_to_meta(chunk, include_audio=False),
-                    "waveform":   ChunkAudioDisplay.waveform(chunk.audio, width=40),
-                    "chunk_tone": chunk_tone,
+                    "data":       chunk_to_meta(single_chunk, include_audio=False),
+                    "waveform":   ChunkAudioDisplay.waveform(single_chunk.audio, width=40)
+                                  if single_chunk.audio is not None else "",
+                    "chunk_tone": ctype.value,
                 })
-                await websocket.send_bytes(float32_to_pcm16(chunk.audio))
+                log.info(ChunkAudioDisplay.display_chunk(single_chunk))
 
-            await websocket.send_bytes(b"")
-            log.info(ChunkAudioDisplay.display_job(all_chunks))
+            await websocket.send_bytes(b"")  # end-of-request sentinel
+            active_job = None
 
     except WebSocketDisconnect:
-        log.info("WS disconnected")
+        log.info("WS disconnected: %s", conn_id)
+        if active_job:
+            active_job.cancelled = True
+            session_cancel.set()
     except Exception as exc:
-        log.error("WS error: %s", exc)
+        log.error("WS error [%s]: %s", conn_id, exc)
         try:
-            await websocket.send_json({"error": str(exc)})
+            await websocket.send_json({"type": "error", "detail": str(exc)})
         except Exception:
             pass
+        if active_job:
+            active_job.cancelled = True
+            session_cancel.set()
+    finally:
+        hb_task.cancel()
+        session_cancel.set()
+        log.info("WS session closed: %s", conn_id)
+
+
+@app.websocket("/ws/tts")
+async def ws_tts(websocket: WebSocket):
+    await _ws_tts_session(websocket)
+
+
+@app.websocket("/ws/tts/pipeline")
+async def ws_tts_pipeline(websocket: WebSocket):
+    """Alias — semantically clearer URL for gateway use."""
+    await _ws_tts_session(websocket)
 
 
 # ── Cancel job ────────────────────────────────────────────────────────────────
@@ -952,75 +1152,6 @@ def preview_chunks(req: TTSRequest):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  WHAT TO ADD TO main.py  (STT microservice)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  Add these two routes to your existing main.py.  No other changes needed.
-#  The pipeline already has push_ai_reference() and commit_tts_enrollment().
-#
-# ── imports to add ─────────────────────────────────────────────────────────
-#  (base64 and numpy already imported in main.py)
-#
-# ── route 1: receive enrollment audio from TTS ──────────────────────────────
-#
-#  from pydantic import BaseModel as _BM
-#
-#  class _EnrollReq(_BM):
-#      pcm_b64:     str
-#      sample_rate: int  = 16000
-#      commit:      bool = True
-#
-#  @app.post("/enroll_tts")
-#  async def enroll_tts(req: _EnrollReq):
-#      """
-#      Called by tts_microservice background enrollment at startup.
-#      Feeds TTS audio directly into the voice filter and locks the profile.
-#      """
-#      try:
-#          raw   = base64.b64decode(req.pcm_b64)
-#          audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-#
-#          # Safety resample in case sample rates ever diverge
-#          if req.sample_rate != 16000 and len(audio) > 0:
-#              try:
-#                  from math import gcd
-#                  from scipy.signal import resample_poly
-#                  g     = gcd(16000, req.sample_rate)
-#                  audio = resample_poly(audio, 16000//g, req.sample_rate//g).astype(np.float32)
-#              except ImportError:
-#                  n     = int(len(audio) * 16000 / req.sample_rate)
-#                  audio = np.interp(
-#                      np.linspace(0, 1, n), np.linspace(0, 1, len(audio)), audio
-#                  ).astype(np.float32)
-#
-#          pipeline = _get_rest_pipeline()
-#          pipeline.push_ai_reference(audio)
-#
-#          if req.commit:
-#              pipeline.commit_tts_enrollment()
-#
-#          enrolled = bool(pipeline.tts_filter and pipeline.tts_filter.is_enrolled)
-#          return {
-#              "enrolled":   enrolled,
-#              "samples":    len(audio),
-#              "duration_s": round(len(audio) / 16000, 2),
-#          }
-#      except Exception as exc:
-#          raise HTTPException(status_code=500, detail=str(exc))
-#
-#
-# ── route 2: reset enrollment (called by TTS re_enroll()) ───────────────────
-#
-#  @app.delete("/enroll_tts")
-#  async def reset_enroll_tts():
-#      """Reset the TTS voice profile so re-enrollment can run fresh."""
-#      pipeline = _get_rest_pipeline()
-#      if pipeline.tts_filter:
-#          pipeline.tts_filter.reset()
-#      return {"status": "enrollment reset"}
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
 
 if __name__ == "__main__":
     uvicorn.run("tts_microservice:app", host="0.0.0.0", port=8765, reload=False)

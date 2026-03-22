@@ -212,6 +212,9 @@ class CAGSystemFreshSession:
                         use_cache=True,
                         num_beams=1,
                         repetition_penalty=1.0,
+                        # temperature and top_p intentionally omitted:
+                        # passing None with do_sample=False triggers a
+                        # transformers warning and is a no-op anyway.
                     )
 
             answer = self.tokenizer.decode(
@@ -334,6 +337,135 @@ class CAGSystemFreshSession:
         except Exception as e:
             yield f"\n[Error: {e}]"
 
+    def stream_chunks(self, user_message: str) -> Generator[str, None, None]:
+        """
+        Stream response as complete, TTS-ready sentence chunks.
+
+        Unlike stream_query() which yields raw sub-word tokens, this method
+        buffers tokens internally and yields only when a natural speech boundary
+        is reached (sentence end, clause break, or max-char cap).
+
+        Each yielded string is a complete utterance the TTS engine can speak
+        immediately — no further accumulation needed in the gateway.
+
+        Chunking rules (mirrors gateway TonalAccumulator):
+          1. First chunk fires as soon as FIRST_CHUNK_CHARS (≥30) chars are ready
+             and a word boundary exists — minimises time-to-first-audio.
+          2. Sentence-ending punctuation (.!?) → flush immediately.
+          3. Clause break (,;:—) → flush if chunk ≥ MIN_TTS_CHARS (20) and
+             remainder ≥ 3 chars.
+          4. Hard cap at LOGIC_MAX_CHARS (160) — split at last word boundary.
+          5. Tail flush at end of stream (remaining buffer).
+        """
+        # ── chunking constants (match gateway TonalAccumulator) ──────────────
+        import re as _re
+
+        _RE_SENTENCE_END = _re.compile(r'(?<=[^\d])([.!?]+["\']?)(?=\s|$)')
+        _RE_CLAUSE_BREAK = _re.compile(r'([,;:—–])\s')
+        _RE_STARTS_PUNCT = _re.compile(r'^[\s,\.!?;:\)\]\}\'\"\\u2019\\u2018\\u201c\\u201d\-]')
+
+        FIRST_CHUNK_CHARS = 30   # ~5-6 words — minimum first chunk
+        MIN_TTS_CHARS     = 20   # minimum chars to bother sending to TTS
+        TONE_MAX_CHARS    = 60   # short = tone chunk (question/exclamation)
+        LOGIC_MAX_CHARS   = 160  # hard cap per chunk
+
+        def _try_flush(buf: str, first_sent: bool):
+            """
+            Try to extract one or more chunks from buf.
+            Returns list of (chunk_text, new_buf, new_first_sent).
+            """
+            results = []
+            while True:
+                # 1. First-chunk early fire
+                if first_sent and len(buf) >= FIRST_CHUNK_CHARS:
+                    split = buf.rfind(" ")
+                    if split >= MIN_TTS_CHARS:
+                        candidate = buf[:split].strip()
+                        remainder = buf[split:].lstrip()
+                        if candidate:
+                            results.append((candidate, remainder, False))
+                            buf        = remainder
+                            first_sent = False
+                            continue
+                # 2. Short chunk or hard cap when not first
+                elif not first_sent and len(buf) >= TONE_MAX_CHARS:
+                    candidate = buf[:TONE_MAX_CHARS].strip()
+                    remainder = buf[TONE_MAX_CHARS:].lstrip()
+                    if candidate:
+                        results.append((candidate, remainder, False))
+                        buf = remainder
+                        continue
+
+                # 3. Sentence boundary
+                m = _RE_SENTENCE_END.search(buf)
+                if m:
+                    candidate = buf[:m.end()].strip()
+                    remainder = buf[m.end():].lstrip()
+                    if candidate:
+                        results.append((candidate, remainder, False))
+                        buf        = remainder
+                        first_sent = False
+                        continue
+                    break
+
+                # 4. Clause break
+                m = _RE_CLAUSE_BREAK.search(buf)
+                if m:
+                    candidate = buf[:m.start() + 1].strip()
+                    remainder = buf[m.end():].lstrip()
+                    if len(candidate) >= MIN_TTS_CHARS and len(remainder) >= 3:
+                        results.append((candidate, remainder, False))
+                        buf        = remainder
+                        first_sent = False
+                        continue
+                    break
+
+                # 5. Hard length cap
+                max_cap = LOGIC_MAX_CHARS if not first_sent else TONE_MAX_CHARS
+                if len(buf) > max_cap:
+                    split = buf[:max_cap].rfind(" ")
+                    if split <= MIN_TTS_CHARS:
+                        split = max_cap
+                    candidate = buf[:split].strip()
+                    remainder = buf[split:].lstrip()
+                    if candidate:
+                        results.append((candidate, remainder, False))
+                        buf        = remainder
+                        first_sent = False
+                        continue
+                    break
+                break
+
+            return results, buf, first_sent
+
+        # ── stream raw tokens and accumulate ─────────────────────────────────
+        buf        = ""
+        first_sent = True
+
+        for raw_token in self.stream_query(user_message):
+            if not raw_token:
+                continue
+
+            # normalise spacing
+            if raw_token.startswith(" "):
+                if buf and buf[-1] == " ":
+                    raw_token = raw_token.lstrip(" ")
+            else:
+                if buf and not buf[-1].isspace() and not _RE_STARTS_PUNCT.match(raw_token):
+                    raw_token = " " + raw_token
+
+            buf += raw_token
+
+            chunks, buf, first_sent = _try_flush(buf, first_sent)
+            for chunk_text, _, _ in chunks:
+                if chunk_text:
+                    yield chunk_text
+
+        # ── tail flush ────────────────────────────────────────────────────────
+        tail = buf.strip()
+        if len(tail) >= 1:
+            yield tail
+
     def reset_and_query(self, user_message: str) -> Dict[str, Any]:
         """
         Clear session history then run a batch query in a single call.
@@ -383,12 +515,31 @@ class CAGSystemFreshSession:
             cache_state.input_ids[0], skip_special_tokens=True
         )
 
+        # ── User-provided data block (HIGHEST priority) ────────────────────
+        # Summarise everything the user has told us so the LLM never has to
+        # guess — this section is placed BEFORE the knowledge base so it wins
+        # in any attention competition.
+        user_data_lines = []
+        if self.memory.user_profile.name:
+            user_data_lines.append(f"User name: {self.memory.user_profile.name}")
+        if self.memory.user_profile.preferences:
+            for k, v in self.memory.user_profile.preferences.items():
+                user_data_lines.append(f"User stated {k}: {v}")
+
+        user_data_block = ""
+        if user_data_lines:
+            user_data_block = (
+                "\n\n══ USER DATA (highest priority — always use this first) ══\n"
+                + "\n".join(user_data_lines)
+            )
+
         # ── System block ───────────────────────────────────────────────────
         parts = [
             "<|begin_of_text|>"
             "<|start_header_id|>system<|end_header_id|>\n"
             + self.system_prompt
-            + "\n\n══ KNOWLEDGE BASE ══\n"
+            + user_data_block
+            + "\n\n══ KNOWLEDGE BASE (use when user data doesn't already answer the question) ══\n"
             + knowledge_text
             + "<|eot_id|>"
         ]
@@ -505,8 +656,6 @@ class CAGSystemFreshSession:
                         attention_mask=attention_mask,
                         max_new_tokens=120,
                         do_sample=False,
-                        temperature=None,
-                        top_p=None,
                         pad_token_id=self.tokenizer.eos_token_id,
                         use_cache=True,
                         num_beams=1,

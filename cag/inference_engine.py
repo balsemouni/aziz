@@ -131,8 +131,8 @@ class CAGInferenceEngine:
                         pad_token_id=self.tokenizer.eos_token_id,
                         use_cache=True,
                         num_beams=1,
-                        temperature=None,
-                        top_p=None,
+                        # temperature/top_p omitted: passing None with
+                        # do_sample=False triggers a transformers warning.
                     )
 
             answer = self.tokenizer.decode(
@@ -232,24 +232,38 @@ class CAGInferenceEngine:
         # Decode the knowledge base from the cached input_ids
         knowledge_text = self.tokenizer.decode(
             cache_state.input_ids[0],
-            skip_special_tokens=True,   # clean text for the system block
+            skip_special_tokens=True,
         )
+
+        # ── User-provided data block (HIGHEST priority) ────────────────────
+        user_data_lines = []
+        if memory is not None and memory.user_profile.name:
+            user_data_lines.append(f"User name: {memory.user_profile.name}")
+        if memory is not None and memory.user_profile.preferences:
+            for k, v in memory.user_profile.preferences.items():
+                user_data_lines.append(f"User stated {k}: {v}")
+        user_data_block = ""
+        if user_data_lines:
+            user_data_block = (
+                "\n\n\u2550\u2550 USER DATA (highest priority \u2014 always use this first) \u2550\u2550\n"
+                + "\n".join(user_data_lines)
+            )
 
         # ── Stage-specific instruction ─────────────────────────
         stage_instruction = ""
         if memory is not None:
-            stage_instruction = (
-                "\n\n══ CURRENT TURN INSTRUCTION ══\n"
-                + memory.get_stage_instruction()
-            )
+            si = memory.get_stage_instruction()
+            if si:
+                stage_instruction = "\n\n\u2550\u2550 CURRENT TURN INSTRUCTION \u2550\u2550\n" + si
 
         # ── System block ───────────────────────────────────────
         system_block = (
             "<|begin_of_text|>"
             "<|start_header_id|>system<|end_header_id|>\n"
             + SYSTEM_PROMPT
+            + user_data_block
             + stage_instruction
-            + "\n\n══ KNOWLEDGE BASE ══\n"
+            + "\n\n\u2550\u2550 KNOWLEDGE BASE (use when user data doesn't already answer) \u2550\u2550\n"
             + knowledge_text
             + "<|eot_id|>\n"
         )

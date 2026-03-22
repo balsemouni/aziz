@@ -1,443 +1,444 @@
 """
-main.py — STT microservice  v5.4.0
-────────────────────────────────────────────────────────────────────────────
+main.py — STT Microservice  v3.2
+══════════════════════════════════════════════════════════════════════════════
 
-FIXES vs v5.2
-─────────────
-  Fix 1 — /enroll_tts now PROPERLY enrolls TTSVoiceGate
-      v5.2 said "AEC-only mode" and only called push_ai_reference(), which
-      feeds the AEC reference buffer but the TTSVoiceGate.enroll() call
-      inside push_ai_reference() was still being called — HOWEVER the pipeline
-      was built with enable_voice_gate=False by default in _build_pipeline().
-      
-      FIX: enable_voice_gate=True is now set in _build_pipeline(), and
-      /enroll_tts correctly calls push_ai_reference() which feeds BOTH
-      AEC reference AND TTSVoiceGate.enroll(). The response now reflects
-      the real voice_gate enrollment status.
+Changes from v3.1
+──────────────────
+  Fix 1 — Non-blocking session creation
+      _build_pipeline() loads Silero VAD + Whisper, which takes 2-5s on first
+      call even with a warmup (the warmup instance is a *different* object;
+      model weights are already in GPU VRAM so the second load is faster, but
+      PyTorch still has to allocate new tensors, re-JIT, etc.).
+      When this happened inside the WebSocket coroutine it blocked the entire
+      event loop: the gateway was flooding the STT _audio_q but nobody was
+      reading it, frames overflowed and were dropped, and the pipeline never
+      saw any audio.
+      Fix: sessions are pre-created at startup (pool of 1) and reused on
+      first connect. Subsequent sessions are built in a thread executor so
+      the event loop stays free.
 
-  Fix 2 — AI speaking → False spam eliminated
-      The gateway sends ai_state=False multiple times when TTS stops
-      (from multiple tasks: synth_worker, play_worker, _finalize_turn).
-      main.py now de-duplicates: only calls notify_ai_speaking() when the
-      state actually CHANGES. This stops the log flood of repeated
-      "[ctrl] AI speaking → False" lines.
+  Fix 2 — LOG_LEVEL env var respected at uvicorn level too
 
-  Fix 3 — DELETE /enroll_tts now does a FULL voice gate reset
-      Previously it was a no-op. Now it calls voice_gate.full_reset()
-      so the TTS service can re-enroll after a speaker/voice change.
+  Fix 3 — Startup warmup now reuses the pre-built session (no second load)
 
-  Fix 4 — /enroll_tts returns real enrolled status
-      Returns voice_gate.is_ready instead of hardcoded True, so the TTS
-      enrollment manager knows the actual state and can retry if needed.
-
-ENDPOINTS
-─────────
-  WS  /stream/mux      — main streaming endpoint (mux audio + control)
-  WS  /stream/binary   — binary-only audio (no control frames)
-  POST /transcribe     — REST full-file transcription
-  POST /enroll_tts     — receive TTS voice PCM → enroll TTSVoiceGate + AEC
-  DELETE /enroll_tts   — full reset of TTS voice profile
-  GET  /health         — version + status
-  GET  /stats          — pipeline stats
+GATEWAY PATCH (still required — see bottom of file):
+  Change STT_WS_URL connect call to  f"{STT_WS_URL}?sid={self.sid}"
 """
 
+from __future__ import annotations
+
 import asyncio
-import base64
+import concurrent.futures
 import io
 import json
 import logging
+import os
+import time
+import uuid
+from typing import Dict, Optional
 
 import numpy as np
 import uvicorn
-import soundfile as sf
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+
 from pipeline import STTPipeline
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+_DEEPFILTER_AVAILABLE = False
+try:
+    from deepfilter import DeepFilterNoiseReducer   # noqa: F401
+    _DEEPFILTER_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+HOST                 = os.getenv("STT_HOST",              "0.0.0.0")
+PORT                 = int(os.getenv("STT_PORT",          "8001"))
+SAMPLE_RATE          = int(os.getenv("SAMPLE_RATE",       "16000"))
+WHISPER_MODEL        = os.getenv("WHISPER_MODEL",         "base.en")
+DEVICE               = os.getenv("DEVICE",                "")
+
+VAD_IDLE_THRESH      = float(os.getenv("VAD_IDLE_THRESH", "0.15"))
+VAD_BARGE_IN_THRESH  = float(os.getenv("VAD_BARGE_IN",    "0.40"))
+VAD_PRE_GAIN         = float(os.getenv("VAD_PRE_GAIN",    "5.0"))
+
+ASR_OVERLAP_S        = float(os.getenv("ASR_OVERLAP_S",   "0.8"))
+ASR_WORD_GAP_MS      = float(os.getenv("ASR_WORD_GAP_MS", "60.0"))
+ASR_CONTEXT_WORDS    = int(os.getenv("ASR_CONTEXT_WORDS", "10"))
+ASR_HISTORY_TURNS    = int(os.getenv("ASR_HISTORY_TURNS", "3"))
+
+ENABLE_AEC           = os.getenv("ENABLE_AEC",          "true").lower()  == "true"
+ENABLE_VOICE_GATE    = os.getenv("ENABLE_VOICE_GATE",    "true").lower()  == "true"
+ENABLE_DEEPFILTER    = os.getenv("ENABLE_DEEPFILTER",    "false").lower() == "true"
+SESSION_IDLE_TIMEOUT = float(os.getenv("SESSION_IDLE_TIMEOUT", "300.0"))
+
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+    level  = getattr(logging, _log_level, logging.INFO),
+    format = "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-logger = logging.getLogger(__name__)
-logging.getLogger("faster_whisper").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("pipeline").setLevel(logging.INFO)
+log = logging.getLogger("stt")
 
-app = FastAPI(title="STT Microservice", version="5.4.0")
+app = FastAPI(title="STT Microservice", version="3.2.0")
 
-MIN_SEGMENT_CHARS = 3
-MAX_REPEATS       = 3
-_LOG_AUDIO_DIAG   = True
-
-# ── Single shared pipeline — loaded once at startup ───────────────────────────
-_pipeline: STTPipeline | None = None
+# Thread pool for building pipelines off the event loop
+_build_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="pipeline-build"
+)
 
 
-@app.on_event("startup")
-async def _startup():
-    global _pipeline
-    logger.info("🔧 Loading STTPipeline (one-time startup)…")
-    loop = asyncio.get_event_loop()
-    _pipeline = await loop.run_in_executor(None, _build_pipeline)
-    logger.info("✅ STTPipeline ready — accepting connections")
+# ─── Pipeline / noise factory (blocking — always call in executor) ────────────
 
-
-def _build_pipeline() -> STTPipeline:
+def _make_pipeline() -> STTPipeline:
+    import torch
+    device = DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
     return STTPipeline(
-        sample_rate           = 16000,
-        whisper_model_size    = "base.en",
-        idle_threshold        = 0.10,
-        barge_in_threshold    = 0.30,
-        vad_pre_gain          = 15.0,
-        enable_aec            = True,
-        # FIX 1: Enable TTSVoiceGate so /enroll_tts actually works
-        enable_voice_gate     = True,
-        voice_gate_threshold  = 0.70,
-        voice_gate_barge_in   = 0.82,
-        voice_gate_min_frames = 8,
-        overlap_seconds       = 0.8,
-        word_gap_ms           = 80.0,
-        max_context_words     = 40,
-        max_history_turns     = 3,
-        asr_min_buffer_ms     = 600.0,
+        sample_rate        = SAMPLE_RATE,
+        device             = device,
+        idle_threshold     = VAD_IDLE_THRESH,
+        barge_in_threshold = VAD_BARGE_IN_THRESH,
+        vad_pre_gain       = VAD_PRE_GAIN,
+        whisper_model_size = WHISPER_MODEL,
+        overlap_seconds    = ASR_OVERLAP_S,
+        word_gap_ms        = ASR_WORD_GAP_MS,
+        max_context_words  = ASR_CONTEXT_WORDS,
+        max_history_turns  = ASR_HISTORY_TURNS,
+        enable_aec         = ENABLE_AEC,
+        enable_voice_gate  = ENABLE_VOICE_GATE,
     )
 
 
-def _get_pipeline() -> STTPipeline:
-    if _pipeline is None:
-        raise RuntimeError("Pipeline not ready — startup not complete")
-    return _pipeline
-
-
-# ── Hallucination / garbage filter ───────────────────────────────────────────
-
-def _filter_segment(text: str) -> str | None:
-    text = text.strip().strip(".,!?;:-\u2013\u2014").strip()
-    if not text:
+def _make_noise_reducer():
+    if not ENABLE_DEEPFILTER or not _DEEPFILTER_AVAILABLE:
         return None
-    if not any(c.isalpha() for c in text):
-        return None
-    if len(text) < MIN_SEGMENT_CHARS:
-        return None
-    words = text.lower().split()
-    if len(words) >= 2:
-        for phrase_len in range(1, min(7, len(words) // 2 + 1)):
-            for i in range(len(words) - phrase_len + 1):
-                phrase = " ".join(words[i:i + phrase_len])
-                count  = sum(
-                    1 for j in range(len(words) - phrase_len + 1)
-                    if " ".join(words[j:j + phrase_len]) == phrase
-                )
-                if count > MAX_REPEATS:
-                    return None
-    return text
-
-
-def _reset_asr_context(pipeline: STTPipeline):
     try:
-        pipeline.realtime_asr._history.clear()
-    except AttributeError:
-        pass
-
-
-# ── TTS self-enrollment endpoints ─────────────────────────────────────────────
-
-class _EnrollReq(BaseModel):
-    pcm_b64:     str
-    sample_rate: int  = 16000
-    commit:      bool = True
-
-
-@app.post("/enroll_tts")
-async def enroll_tts(req: _EnrollReq):
-    """
-    Called by tts_microservice background enrollment at startup.
-
-    Feeds TTS audio into BOTH:
-      • AECGate      — spectral subtraction reference
-      • TTSVoiceGate — acoustic fingerprint enrollment
-
-    Both gates receive audio via pipeline.push_ai_reference(), which
-    internally calls both aec.push_reference() and voice_gate.enroll().
-
-    Returns enrolled=True once TTSVoiceGate has enough frames (>= min_enroll_frames).
-    Returns enrolled=False while still accumulating (TTS service will retry).
-    """
-    try:
-        raw   = base64.b64decode(req.pcm_b64)
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-        # Resample to 16 kHz if needed
-        if req.sample_rate != 16000 and len(audio) > 0:
-            try:
-                from math import gcd
-                from scipy.signal import resample_poly
-                g     = gcd(16000, req.sample_rate)
-                audio = resample_poly(audio, 16000 // g, req.sample_rate // g).astype(np.float32)
-            except ImportError:
-                n     = int(len(audio) * 16000 / req.sample_rate)
-                audio = np.interp(
-                    np.linspace(0, 1, n), np.linspace(0, 1, len(audio)), audio
-                ).astype(np.float32)
-
-        pipeline = _get_pipeline()
-
-        # This calls BOTH aec.push_reference() AND voice_gate.enroll() internally
-        pipeline.push_ai_reference(audio)
-
-        # Check if the voice gate is now ready (has enough enrolled frames)
-        voice_gate_ready = (
-            pipeline.voice_gate is not None and pipeline.voice_gate.is_ready
-        )
-
-        enrolled_frames = (
-            pipeline.voice_gate._n_enrolled
-            if pipeline.voice_gate is not None else 0
-        )
-
-        logger.info(
-            f"[enroll_tts] fed {len(audio)} samples ({len(audio)/16000:.2f}s) "
-            f"→ voice_gate enrolled={voice_gate_ready} "
-            f"frames={enrolled_frames}"
-        )
-
-        # FIX 4: Return REAL enrolled status (not hardcoded True)
-        # TTS service retries until enrolled=True, so this is safe.
-        return {
-            "enrolled":       voice_gate_ready,
-            "samples":        len(audio),
-            "duration_s":     round(len(audio) / 16000, 2),
-            "enrolled_frames": enrolled_frames,
-        }
-
+        from deepfilter import DeepFilterNoiseReducer
+        return DeepFilterNoiseReducer(sample_rate=SAMPLE_RATE)
     except Exception as exc:
-        logger.error(f"[enroll_tts] {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        log.warning(f"DeepFilter failed: {exc}")
+        return None
 
 
-@app.delete("/enroll_tts")
-async def reset_enroll_tts():
+def _pcm_to_f32(raw: bytes) -> np.ndarray:
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+# ─── Session ──────────────────────────────────────────────────────────────────
+
+class _Session:
     """
-    FIX 3: Full reset of TTSVoiceGate voice profile.
-    Called by TTS service before re-enrollment after a speaker/voice change.
+    One per gateway WebSocket (?sid= keyed).
+
+    NEVER construct directly from the event loop — use _Session.create()
+    which runs the blocking pipeline load in a thread executor.
+
+    Threading
+    ─────────
+    process_chunk is dispatched to a single-worker executor so:
+      • It never blocks the asyncio event loop.
+      • Frames are always processed serially (queue depth = 1 thread).
+    asyncio.Lock prevents a second frame entering run_in_executor while the
+    first is still running (belt-and-suspenders for high-throughput streams).
     """
-    pipeline = _get_pipeline()
-    if pipeline.voice_gate is not None:
-        pipeline.voice_gate.full_reset()
-        logger.info("[enroll_tts] TTSVoiceGate voice profile fully reset")
-    if pipeline.aec is not None:
-        pipeline.aec.reset()
-        logger.info("[enroll_tts] AECGate reference buffer reset")
-    return {"status": "ok", "voice_gate_reset": pipeline.voice_gate is not None}
+
+    def __init__(self, sid: str, pipeline: STTPipeline, noise):
+        self.sid      = sid
+        self.pipeline = pipeline
+        self.noise    = noise
+        self._last_rx = time.monotonic()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"stt-{sid[:8]}"
+        )
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    async def create(cls, sid: str) -> "_Session":
+        """Build a session without blocking the event loop."""
+        loop     = asyncio.get_event_loop()
+        pipeline = await loop.run_in_executor(_build_executor, _make_pipeline)
+        noise    = await loop.run_in_executor(_build_executor, _make_noise_reducer)
+        return cls(sid, pipeline, noise)
+
+    def touch(self):
+        self._last_rx = time.monotonic()
+
+    def idle_s(self) -> float:
+        return time.monotonic() - self._last_rx
+
+    def close(self):
+        self._executor.shutdown(wait=False)
 
 
-# ── REST transcribe ───────────────────────────────────────────────────────────
+# ─── Session registry ─────────────────────────────────────────────────────────
 
-@app.post("/transcribe")
-async def transcribe_file(file: UploadFile = File(...)):
-    raw = await file.read()
-    try:
-        audio, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot decode audio: {e}")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != 16000:
-        try:
-            from scipy.signal import resample_poly
-            from math import gcd
-            g = gcd(16000, sr)
-            audio = resample_poly(audio, 16000 // g, sr // g).astype(np.float32)
-        except ImportError:
-            raise HTTPException(status_code=422, detail="scipy required for resampling")
-    return {"transcript": _get_pipeline().transcribe_full(audio)}
+_sessions: Dict[str, _Session] = {}
+
+# Pre-warmed session ready for the FIRST incoming connection.
+# After startup completes this holds a fully loaded _Session.
+# The first WebSocket that has no existing sid claims it instantly
+# (zero model-load latency on first call).
+_warm_session: Optional[_Session] = None
 
 
-# ── WebSocket /stream/mux ─────────────────────────────────────────────────────
+async def _reap_idle_sessions():
+    while True:
+        await asyncio.sleep(60)
+        dead = [sid for sid, s in _sessions.items() if s.idle_s() > SESSION_IDLE_TIMEOUT]
+        for sid in dead:
+            sess = _sessions.pop(sid, None)
+            if sess:
+                sess.close()
+            log.info(f"[reaper] evicted {sid}")
+
+
+# ─── WebSocket endpoint ───────────────────────────────────────────────────────
 
 @app.websocket("/stream/mux")
-async def stream_audio_mux(websocket: WebSocket):
-    await websocket.accept()
-    client = websocket.client
-    logger.info(f"🔌 WS connected: {client}")
+async def stream_mux(ws: WebSocket):
+    global _warm_session
+    await ws.accept()
 
-    pipeline = _get_pipeline()
-    pipeline.reset()
-    _reset_asr_context(pipeline)
+    sid = ws.query_params.get("sid") or str(uuid.uuid4())
 
-    diag_count:    int  = 0
+    if sid in _sessions:
+        # Reconnect — reuse existing session (keeps Whisper history)
+        sess = _sessions[sid]
+        log.info(f"[{sid}] reconnected — pipeline preserved")
+    elif _warm_session is not None:
+        # Claim the pre-warmed session (zero latency on first connect)
+        sess = _warm_session
+        sess.sid = sid
+        _warm_session = None
+        _sessions[sid] = sess
+        log.info(f"[{sid}] claimed pre-warmed session")
+        # Kick off building the next warm session in the background
+        asyncio.create_task(_pre_warm())
+    else:
+        # Build a new session off the event loop (non-blocking)
+        log.info(f"[{sid}] building session (first connect — models loading)…")
+        sess = await _Session.create(sid)
+        _sessions[sid] = sess
+        log.info(f"[{sid}] session ready")
+
     try:
-        async for message in websocket.iter_bytes():
-            if len(message) < 1:
+        async for raw in ws.iter_bytes():
+            if not raw:
                 continue
 
-            frame_type = message[0]
-            payload    = message[1:]
+            sess.touch()
+            ftype   = raw[0]
+            payload = raw[1:]
 
-            # ── Audio frame (0x01) ────────────────────────────────────────
-            if frame_type == 0x01:
-                # int16 needs exactly 2 bytes per sample — drop stray odd byte
-                if len(payload) % 2 != 0:
-                    payload = payload[: len(payload) - 1]
-                if not payload:
+            # ── 0x01  Audio ───────────────────────────────────────────────
+            if ftype == 0x01:
+                if len(payload) < 2:
                     continue
-                pcm = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
-                diag_count += 1
 
-                if _LOG_AUDIO_DIAG and diag_count % 200 == 1:
-                    rms       = float(np.sqrt(np.mean(pcm**2))) if len(pcm) else 0.0
-                    vad_state = pipeline.vad.get_state() if hasattr(pipeline, "vad") else {}
-                    logger.debug(
-                        f"[diag] chunk={diag_count}  rms={rms:.4f}  "
-                        f"vad_prob={vad_state.get('prob', 0):.3f}"
+                audio = _pcm_to_f32(payload)
+
+                if sess.noise is not None:
+                    audio = sess.noise.process(audio)
+
+                async with sess._lock:
+                    events = await asyncio.get_event_loop().run_in_executor(
+                        sess._executor,
+                        sess.pipeline.process_chunk,
+                        audio,
                     )
 
-                events = pipeline.process_chunk(pcm)
+                for ev in events:
+                    await ws.send_json(ev)
+                    log.debug(f"[{sid}] ← {ev}")
 
-                for event in events:
-                    etype = event.get("type")
-
-                    if etype == "word":
-                        word = event.get("word", "").strip()
-                        if word:
-                            logger.debug(f"WORD: {word}")
-                        await websocket.send_json(event)
-
-                    elif etype == "partial":
-                        await websocket.send_json(event)
-
-                    elif etype == "segment":
-                        raw_text = event.get("text", "").strip()
-                        clean    = _filter_segment(raw_text)
-                        if clean is None:
-                            continue
-                        if clean != raw_text:
-                            event = {**event, "text": clean}
-                        logger.info(f"SEGMENT: {clean}")
-                        await websocket.send_json(event)
-                        _reset_asr_context(pipeline)
-
-                    else:
-                        await websocket.send_json(event)
-
-            # ── Control frame (0x02) ──────────────────────────────────────
-            elif frame_type == 0x02:
+            # ── 0x02  Control ─────────────────────────────────────────────
+            elif ftype == 0x02:
                 try:
-                    ctrl     = json.loads(payload.decode("utf-8"))
-                    msg_type = ctrl.get("type")
+                    ctrl = json.loads(payload)
+                except Exception:
+                    await ws.send_json({"type": "error", "message": "bad control JSON"})
+                    continue
 
-                    if msg_type == "assistant_turn":
-                        text = ctrl.get("text", "").strip()
-                        if text:
-                            pipeline.add_assistant_turn(text)
+                mtype = ctrl.get("type", "")
 
-                    elif msg_type == "reset_context":
-                        _reset_asr_context(pipeline)
-                        await websocket.send_json({"type": "context_reset"})
+                if mtype == "reset_context":
+                    sess.pipeline.reset()
+                    log.info(f"[{sid}] reset")
+                    await ws.send_json({"type": "reset_ok"})
 
-                    elif msg_type == "ping":
-                        await websocket.send_json({"type": "pong"})
+                elif mtype == "hard_reset":
+                    sess.pipeline.reset()
+                    sess.pipeline.realtime_asr.reset()
+                    log.info(f"[{sid}] hard reset")
+                    await ws.send_json({"type": "reset_ok"})
 
-                    elif msg_type == "get_stats":
-                        await websocket.send_json({"type": "stats", **pipeline.get_stats()})
+                elif mtype in ("assistant_turn", "add_assistant_turn"):
+                    # Gateway v14 sends "assistant_turn" after each CAG reply
+                    text = ctrl.get("text", "").strip()
+                    if text:
+                        sess.pipeline.realtime_asr.add_assistant_turn(text)
+                        log.debug(f"[{sid}] assistant turn: {text[:80]!r}")
 
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass  # WS ping/pong frames occasionally land here — ignore
+                elif mtype == "get_stats":
+                    stats = sess.pipeline.get_stats()
+                    stats.update({"sid": sid, "idle_s": round(sess.idle_s(), 1)})
+                    await ws.send_json({"type": "stats", **stats})
 
-            # ── Unknown frame type — silently drop ────────────────────────
-            # WebSocket library ping (0x89) / pong (0x8a) / close (0x88)
-            # frames can surface here as raw bytes. They are not audio
-            # or control frames — just ignore them.
-            else:
-                logger.debug(f"[mux] dropping unknown frame_type=0x{frame_type:02x} len={len(payload)}")
+                elif mtype == "ping":
+                    await ws.send_json({"type": "pong"})
+
+                else:
+                    log.debug(f"[{sid}] unknown ctrl: {mtype!r}")
 
     except WebSocketDisconnect:
-        logger.info(f"🔌 WS disconnected: {client}")
-        final = pipeline.flush()
-        if final:
-            clean = _filter_segment(final)
-            if clean:
-                try:
-                    await websocket.send_json({"type": "segment", "text": clean})
-                except Exception:
-                    pass
-
-    except Exception as e:
-        logger.exception(f"[MUX] error: {e}")
+        log.info(f"[{sid}] disconnected")
+    except Exception as exc:
+        log.error(f"[{sid}] error: {exc}", exc_info=True)
         try:
-            await websocket.send_json({"type": "error", "detail": str(e)})
-            await websocket.close()
+            await ws.send_json({"type": "error", "message": str(exc)})
         except Exception:
             pass
 
 
-# ── WebSocket /stream/binary ──────────────────────────────────────────────────
+# ─── REST ─────────────────────────────────────────────────────────────────────
 
-@app.websocket("/stream/binary")
-async def stream_audio_binary(websocket: WebSocket):
-    await websocket.accept()
-    pipeline = _get_pipeline()
-    pipeline.reset()
+@app.post("/transcribe")
+async def transcribe_file(file: UploadFile = File(...)):
+    t0  = time.monotonic()
+    raw = await file.read()
     try:
-        async for message in websocket.iter_bytes():
-            if not message:
-                continue
-            # int16 needs exactly 2 bytes per sample — drop stray odd byte
-            if len(message) % 2 != 0:
-                message = message[: len(message) - 1]
-            if not message:
-                continue
-            pcm    = np.frombuffer(message, dtype=np.int16).astype(np.float32) / 32768.0
-            events = pipeline.process_chunk(pcm)
-            for event in events:
-                if event.get("type") == "segment":
-                    text = _filter_segment(event.get("text", ""))
-                    if not text:
-                        continue
-                    event = {**event, "text": text}
-                    _reset_asr_context(pipeline)
-                await websocket.send_json(event)
-    except WebSocketDisconnect:
-        final = pipeline.flush()
-        if final:
-            clean = _filter_segment(final)
-            if clean:
-                await websocket.send_json({"type": "segment", "text": clean})
-    except Exception as e:
-        await websocket.send_json({"type": "error", "detail": str(e)})
+        import soundfile as sf
+        data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        if sr != SAMPLE_RATE:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g    = gcd(SAMPLE_RATE, sr)
+            data = resample_poly(data, SAMPLE_RATE // g, sr // g).astype(np.float32)
+        audio = data if data.ndim == 1 else data[:, 0]
+    except Exception:
+        audio = _pcm_to_f32(raw)
+
+    pipe   = await asyncio.get_event_loop().run_in_executor(_build_executor, _make_pipeline)
+    text   = pipe.transcribe_full(audio)
+    lat_ms = (time.monotonic() - t0) * 1000
+    return {"text": text, "latency_ms": round(lat_ms, 1)}
 
 
-# ── Health / Stats ────────────────────────────────────────────────────────────
+@app.post("/reset/{sid}")
+async def reset_session(sid: str):
+    sess = _sessions.get(sid)
+    if not sess:
+        raise HTTPException(404, f"session {sid!r} not found")
+    sess.pipeline.reset()
+    return {"status": "reset", "sid": sid}
 
-@app.get("/health")
-def health():
-    pipeline = _pipeline
-    vg_ready = (
-        pipeline.voice_gate is not None and pipeline.voice_gate.is_ready
-        if pipeline else False
-    )
+
+@app.get("/stats/{sid}")
+async def session_stats(sid: str):
+    sess = _sessions.get(sid)
+    if not sess:
+        raise HTTPException(404, f"session {sid!r} not found")
+    stats = sess.pipeline.get_stats()
+    stats.update({"sid": sid, "idle_s": round(sess.idle_s(), 1)})
+    return stats
+
+
+@app.get("/sessions")
+async def list_sessions():
     return {
-        "status":              "ok",
-        "version":             "5.4.0",
-        "pipeline_ready":      pipeline is not None,
-        "voice_gate_enrolled": vg_ready,
+        "sessions": [
+            {"sid": sid, "idle_s": round(s.idle_s(), 1)}
+            for sid, s in _sessions.items()
+        ]
     }
 
 
-@app.get("/stats")
-def stats():
-    return _get_pipeline().get_stats()
+@app.get("/health")
+async def health():
+    return {
+        "status":     "ok",
+        "version":    "3.2.0",
+        "model":      WHISPER_MODEL,
+        "deepfilter": ENABLE_DEEPFILTER and _DEEPFILTER_AVAILABLE,
+        "sessions":   len(_sessions),
+        "warm":       _warm_session is not None,
+    }
 
+
+# ─── Pre-warm helper ──────────────────────────────────────────────────────────
+
+async def _pre_warm():
+    """Build one session in the background and park it as _warm_session."""
+    global _warm_session
+    if _warm_session is not None:
+        return
+    try:
+        log.info("[warm] Building next warm session…")
+        sess = await _Session.create("__warm__")
+        # Quick smoke-test so VAD and Whisper tensors are allocated
+        await asyncio.get_event_loop().run_in_executor(
+            sess._executor,
+            sess.pipeline.process_chunk,
+            np.zeros(512, dtype=np.float32),
+        )
+        _warm_session = sess
+        log.info("[warm] ✅ Warm session ready")
+    except Exception as exc:
+        log.warning(f"[warm] Failed: {exc}")
+
+
+# ─── Startup ──────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def _startup():
+    log.info("=" * 60)
+    log.info("  STT Microservice v3.2")
+    log.info(f"  Listen     : {HOST}:{PORT}")
+    log.info(f"  Whisper    : {WHISPER_MODEL}")
+    log.info(f"  DeepFilter : {'ON' if (ENABLE_DEEPFILTER and _DEEPFILTER_AVAILABLE) else 'OFF'}")
+    log.info(f"  AEC        : {'ON (passive)' if ENABLE_AEC else 'OFF'}")
+    log.info(f"  VoiceGate  : {'ON (passive)' if ENABLE_VOICE_GATE else 'OFF'}")
+    log.info("=" * 60)
+
+    # Build and smoke-test the warm session during startup.
+    # This means the FIRST incoming gateway connection gets a pipeline with
+    # zero model-load latency — models are already in GPU memory.
+    log.info("[startup] Pre-warming pipeline (loading Silero VAD + Whisper)…")
+    await _pre_warm()
+
+    asyncio.create_task(_reap_idle_sessions())
+    log.info("[startup] Ready — session reaper running")
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8001,
-        reload=False,
-        ws_ping_interval=20,
-        ws_ping_timeout=20,
+        host      = HOST,
+        port      = PORT,
+        workers   = 1,       # MUST be 1 — torch models not fork-safe
+        reload    = False,
+        log_level = _log_level.lower(),
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REQUIRED ONE-LINE PATCH TO gateway.py  (_stt_loop, line ~957)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  BEFORE:
+#      stt_ws = await _ws_connect(
+#          STT_WS_URL, max_retries=STT_MAX_RETRIES,
+#
+#  AFTER:
+#      stt_ws = await _ws_connect(
+#          f"{STT_WS_URL}?sid={self.sid}", max_retries=STT_MAX_RETRIES,
+#
+#  Without this, all gateway sessions share one pipeline and corrupt each
+#  other's VAD accumulator and ASR buffer.
+# ══════════════════════════════════════════════════════════════════════════════

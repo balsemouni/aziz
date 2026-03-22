@@ -72,12 +72,12 @@ BARGE_IN_COOLDOWN_S = float(os.getenv("BARGE_IN_COOLDOWN_S", "2.0"))
 ECHO_TAIL_GUARD_S   = float(os.getenv("ECHO_TAIL_GUARD_S",   "1.5"))
 STT_SILENCE_MS      = float(os.getenv("STT_SILENCE_MS",      "600"))
 
-MIN_TTS_CHARS       = int(os.getenv("MIN_TTS_CHARS",          "20"))  # ~3-4 words minimum for Orpheus
+MIN_TTS_CHARS       = int(os.getenv("MIN_TTS_CHARS",          "8"))
 TONE_MAX_CHARS      = int(os.getenv("TONE_MAX_CHARS",         "60"))
 LOGIC_MAX_CHARS     = int(os.getenv("LOGIC_MAX_CHARS",        "160"))
-FIRST_CHUNK_CHARS   = int(os.getenv("FIRST_CHUNK_CHARS",      "30"))   # ~5-6 words — Orpheus minimum reliable length
+FIRST_CHUNK_CHARS   = int(os.getenv("FIRST_CHUNK_CHARS",      "20"))
 
-TTS_MAX_PARALLEL    = int(os.getenv("TTS_MAX_PARALLEL",       "4"))   # must match SYNTH_WORKERS
+TTS_MAX_PARALLEL    = int(os.getenv("TTS_MAX_PARALLEL",       "4"))
 TTS_MAX_RETRIES     = int(os.getenv("TTS_MAX_RETRIES",        "3"))
 STT_MAX_RETRIES     = int(os.getenv("STT_MAX_RETRIES",        "5"))
 CAG_MAX_RETRIES     = int(os.getenv("CAG_MAX_RETRIES",        "3"))
@@ -419,9 +419,7 @@ class TonalAccumulator:
             if m:
                 candidate = buf[:m.end()].strip()
                 remainder = buf[m.end():].lstrip()
-                # Always fire on a sentence boundary — even a single word like "Hello!"
-                # is a complete utterance. Only skip if candidate is empty.
-                if candidate:
+                if len(candidate) >= MIN_TTS_CHARS or not self._first_sent:
                     results.append(TonalChunk(text=candidate, tone=_classify_tone(candidate)))
                     self._buf        = remainder
                     self._first_sent = False
@@ -819,49 +817,7 @@ class GatewaySession:
             log.warning(f"[{self.sid}] STT not ready after 15s — continuing anyway")
 
         log.info(f"[{self.sid}] Echo gate ready")
-
-        # Fire a silent TTS pre-warm in background so the Orpheus thread pool
-        # worker for this session's voice is alive and CUDA tensors are resident.
-        # We discard the audio — we only want kernel warm-up latency.
-        asyncio.create_task(self._prewarm_tts(), name=f"prewarm_{self.sid}")
-
         await self._jsend({"type": "ready", "message": "Pipeline ready — speak to begin"})
-
-    async def _prewarm_tts(self):
-        """
-        Open one TTS WebSocket and synthesize a short silent phrase.
-        The audio is discarded — the goal is to:
-          1. Force Orpheus CUDA kernels to compile (first-run JIT cost ~1-2s)
-          2. Keep the thread-pool worker alive and resident in GPU L2 cache
-        Called once per session so the FIRST real utterance comes back fast.
-        """
-        tts_ws = None
-        try:
-            tts_ws = await _ws_connect(
-                TTS_WS_URL, max_retries=1,
-                label=f"[{self.sid}] prewarm",
-                max_size=4 * 1024 * 1024,
-                ping_interval=None, ping_timeout=None,
-            )
-            # Use a sentence long enough for Orpheus — short inputs produce no audio.
-            await tts_ws.send(json.dumps({
-                "text":       "Hello, I am ready to assist you with any questions you may have.",
-                "chunk_tone": "tone",
-            }))
-            # Drain all frames and discard
-            while True:
-                frame = await asyncio.wait_for(tts_ws.recv(), timeout=30.0)
-                if isinstance(frame, bytes) and frame == b"":
-                    break
-            log.info(f"[{self.sid}] TTS pre-warm complete")
-        except Exception as e:
-            log.debug(f"[{self.sid}] TTS pre-warm skipped: {e}")
-        finally:
-            if tts_ws:
-                try:
-                    await tts_ws.close()
-                except Exception:
-                    pass
 
 
 
@@ -997,9 +953,8 @@ class GatewaySession:
 
         while self._running and retries < STT_MAX_RETRIES:
             try:
-                stt_url = f"{STT_WS_URL}?sid={self.sid}"
                 stt_ws = await _ws_connect(
-                    stt_url, max_retries=STT_MAX_RETRIES,
+                    STT_WS_URL, max_retries=STT_MAX_RETRIES,
                     label=f"[{self.sid}] STT",
                     max_size=2 * 1024 * 1024,
                     ping_interval=WS_PING_INTERVAL,
@@ -1354,10 +1309,6 @@ class GatewaySession:
                 full_reply_parts.append(token)
                 await self._jsend({"type": "ai_token", "token": token})
 
-                # CAG now sends complete TTS-ready sentence chunks (not raw
-                # sub-word tokens).  Each chunk fed into TonalAccumulator will
-                # hit a sentence boundary or the first-chunk length threshold
-                # immediately, so acc.feed() returns it without buffering delay.
                 # Dispatch to TTS immediately on each accumulated sentence chunk
                 for tc in acc.feed(token):
                     if self._barge_in:
@@ -1542,22 +1493,7 @@ class GatewaySession:
             pending_tasks = [t for t in pending_tasks if not t.done()]
 
     async def _synth_one(self, tc: TonalChunk, idx: int):
-        """
-        Synthesize one TTS chunk and stream PCM frames into pcm_q as they arrive.
-
-        STREAMING FIX: TTS microservice now sends raw int16 PCM byte frames
-        incrementally as Orpheus generates them, followed by a JSON chunk_meta
-        frame, then b"" as the end-of-stream sentinel.
-
-        Frame sequence from TTS WS:
-          1. bytes  — WAV header (44 bytes) — skip
-          2. bytes  — raw int16 PCM chunk   — forward immediately (repeat N times)
-          3. str    — JSON chunk_meta        — record latency
-          4. bytes  — b""                   — end of stream
-
-        We put each PCM frame into pcm_q individually so _play_worker can start
-        sending audio to the client before synthesis is complete.
-        """
+        """Synthesize one TTS chunk, put (idx, frames) into pcm_q."""
         text = tc.text.strip()
         if not text:
             await self._pcm_q.put((idx, []))
@@ -1588,15 +1524,15 @@ class GatewaySession:
                         "chunk_tone": tc.tone,
                     }))
 
-                    wav_header_skipped = False
-                    first_audio_ok     = False
+                    wav_skipped    = False
+                    first_audio_ok = False
 
                     while True:
                         if self._barge_in:
                             frames = []
                             break
                         try:
-                            frame = await asyncio.wait_for(tts_ws.recv(), timeout=120.0)  # Orpheus can be slow on first token
+                            frame = await asyncio.wait_for(tts_ws.recv(), timeout=30.0)
                         except asyncio.TimeoutError:
                             log.warning(f"[{self.sid}] synth_one[{idx}] TTS timeout")
                             break
@@ -1606,29 +1542,19 @@ class GatewaySession:
 
                         if isinstance(frame, bytes):
                             if frame == b"":
-                                # End-of-stream sentinel — synthesis complete
                                 break
-                            if not wav_header_skipped:
-                                # First binary frame is always the WAV header — skip it
-                                wav_header_skipped = True
+                            if not wav_skipped:
+                                wav_skipped = True
                                 continue
-                            # ── STREAMING: forward PCM to play_worker immediately ──
-                            # Each raw int16 PCM chunk goes straight into pcm_q so
-                            # _play_worker can forward it to the client without waiting
-                            # for the full chunk synthesis to complete.
-                            if frame and not self._barge_in:
+                            if frame:
                                 if not first_audio_ok:
                                     first_audio_ok = True
                                     if idx == 0:
                                         self._lat.on_tts_audio_start()
                                 frames.append(frame)
-                                self._echo_gate.feed_tts(frame)
-                                # Emit a streaming frame immediately so play_worker
-                                # can send it to the client right now
-                                await self._pcm_q.put(("PCM_FRAME", idx, frame))
+                                self._echo_gate.feed_tts(frame)   # keep ring buffer current
 
                         elif isinstance(frame, str):
-                            # JSON metadata — record latency, sent AFTER all PCM
                             try:
                                 msg = json.loads(frame)
                             except Exception:
@@ -1643,7 +1569,7 @@ class GatewaySession:
                                 )
                             elif msg.get("error"):
                                 log.warning(f"[{self.sid}] TTS error msg: {msg['error']}")
-                    break   # success — exit retry loop
+                    break
 
                 except Exception as e:
                     retries += 1
@@ -1661,28 +1587,21 @@ class GatewaySession:
 
         synth_ms = (time.monotonic() - t_start) * 1000
         log.debug(f"[{self.sid}] synth_one[{idx}] done {synth_ms:.0f}ms frames={len(frames)}")
-        # Put all frames in one batch — play_worker handles ordering.
-        # Frames were already streamed from TTS as they arrived; we now
-        # deliver them as a batch so the reorder buffer works correctly.
         await self._pcm_q.put((idx, frames))
 
     # ─── Play worker ──────────────────────────────────────────────────────────
 
     async def _play_worker(self):
         """
-        Receives items from pcm_q and streams PCM to the client in order.
-
-        Queue items:
-          self._INTERRUPT          — barge-in: drain and reset
-          ("TURN_END", N)          — all N chunks submitted
-          ("PCM_FRAME", idx, bytes)— individual streaming frame (send immediately if in order)
-          (order_idx, frames)      — batch completion marker from _synth_one
+        Receives (order_index, frames) from pcm_q, reorders them, and streams
+        PCM bytes to the client in correct sentence order.
+        On INTERRUPT: drains and resets.
         """
-        next_expected    = 0
-        reorder_buf:     dict[int, list[bytes]] = {}
-        chunk_count      = 0
-        total_expected   = -1
-        chunks_received  = 0
+        next_expected   = 0
+        reorder_buf:    dict[int, list[bytes]] = {}
+        chunk_count     = 0
+        total_expected  = -1
+        chunks_received = 0
 
         async def _flush_ordered():
             nonlocal next_expected, chunk_count
@@ -1690,7 +1609,7 @@ class GatewaySession:
                 frames = reorder_buf.pop(next_expected)
                 for f in frames:
                     await self._bsend(f)
-                    self._echo_gate.feed_tts(f)
+                    self._echo_gate.feed_tts(f)   # arm gate with audio playing RIGHT NOW
                 chunk_count   += 1
                 next_expected += 1
 
@@ -1700,7 +1619,7 @@ class GatewaySession:
             await _flush_ordered()
             await asyncio.sleep(ECHO_TAIL_GUARD_S)
             self._tts_stopped_at = time.monotonic()
-            self._echo_gate.tts_stopped()
+            self._echo_gate.tts_stopped()   # start tail guard
             report = self._lat.complete_turn()
             if report:
                 await self._jsend({"type": "latency", "stage": "turn_complete", **report})
@@ -1724,7 +1643,7 @@ class GatewaySession:
                 chunks_received = 0
                 self.state      = State.IDLE
                 self._tts_stopped_at = time.monotonic()
-                self._echo_gate.tts_stopped()
+                self._echo_gate.tts_stopped()   # start tail guard
                 report = self._lat.complete_turn()
                 if report:
                     report["barge_in"] = True
@@ -1739,23 +1658,6 @@ class GatewaySession:
                     await _finalize_turn()
                 continue
 
-            # Streaming PCM frame — send immediately if this is the next expected chunk
-            if isinstance(item, tuple) and len(item) == 3 and item[0] == "PCM_FRAME":
-                _, frame_idx, pcm_bytes = item
-                if self._barge_in:
-                    continue
-                self.state = State.SPEAKING
-                if frame_idx == next_expected:
-                    await self._bsend(pcm_bytes)
-                    self._echo_gate.feed_tts(pcm_bytes)
-                else:
-                    # Out-of-order: buffer until predecessor completes
-                    reorder_buf.setdefault(frame_idx, []).append(pcm_bytes)
-                continue
-
-            # Batch completion marker: (order_idx, frames)
-            # _synth_one sends this when all streaming frames for this chunk are done.
-            # frames is [] when streaming already delivered the bytes live.
             order_idx, frames = item
 
             if self._barge_in:
@@ -1763,24 +1665,15 @@ class GatewaySession:
                 continue
 
             chunks_received += 1
-            self.state = State.SPEAKING
-
-            if frames:
-                # Batch path (streaming was cancelled or empty)
-                reorder_buf[order_idx] = frames
-
-            # If streaming already sent frames for this chunk (PCM_FRAME path),
-            # just tick the counter; otherwise flush normally from reorder_buf.
-            if order_idx == next_expected and order_idx not in reorder_buf:
-                next_expected += 1
-                chunk_count   += 1
-
+            self.state       = State.SPEAKING
+            reorder_buf[order_idx] = frames
             await _flush_ordered()
 
             if total_expected >= 0 and chunks_received >= total_expected:
                 await _flush_ordered()
                 if not reorder_buf:
                     await _finalize_turn()
+
 
 # ─── App startup ──────────────────────────────────────────────────────────────
 
