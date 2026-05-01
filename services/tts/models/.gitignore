@@ -1,0 +1,4 @@
+# Piper ONNX voice models — large binary files, do not commit.
+# Download with:
+#   python download_voices.py
+*.onnx

@@ -1,9 +1,0 @@
-fastapi
-uvicorn[standard]
-torch
-soundfile
-scipy
-numpy
-python-dotenv
-qwen-tts
-requests
