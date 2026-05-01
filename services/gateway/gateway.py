@@ -1101,20 +1101,24 @@ class GatewaySession:
                         kind = ev.get("type", "")
                         
                         if kind == "barge_in":
-                            # Act immediately on barge-in — the STT pipeline's own
-                            # debounce (2 voice frames, prob ≥ 0.40, 1500ms cooldown)
-                            # is enough guard against spurious echoes. Requiring
-                            # word_buf to be non-empty caused a stalemate: the AEC
-                            # gate suppressed all audio so words never arrived →
-                            # _do_barge_in_immediate was never called → ai_state=False
-                            # was never sent → pipeline stayed suppressed forever.
+                            # Act immediately on barge-in. Clear the partial
+                            # word buffer and cancel the in-flight silence timer
+                            # so the pre-barge-in fragment (e.g. "you") is NOT
+                            # fired as an incomplete query. After the reset the
+                            # user's full post-barge-in utterance accumulates
+                            # fresh and is sent as one complete query.
                             if not barge_triggered_this_turn:
                                 barge_triggered_this_turn = True
                                 await self._do_barge_in_immediate()
-                                # Drop any queries queued behind the cancelled turn.
                                 _drain_q(self._query_q)
-                                # Keep word_buf and silence_task alive so captured
-                                # words reach CAG as soon as the user stops talking.
+                                # Reset accumulation so the full utterance is
+                                # captured as a single clean query, not split
+                                # across multiple fire_query calls.
+                                word_buf.clear()
+                                last_fired_text = ""
+                                if silence_task and not silence_task.done():
+                                    silence_task.cancel()
+                                silence_task = None
                             continue
                         
                         elif kind == "word":
@@ -1510,17 +1514,24 @@ class GatewaySession:
                             return
                         if not line.startswith("data:"):
                             continue
-                        data = line[5:].strip()
-                        if data.startswith("[TURN_ID]"):
-                            server_tid = data[9:].strip()
+                        # Preserve leading space in token content — Qwen2.5/tiktoken
+                        # tokenizers embed a leading space on every genuine word-start
+                        # token (e.g. " you"). Stripping it produces merged words like
+                        # "assistyou". Only strip for control markers ([DONE] etc.).
+                        data    = line[5:]          # raw content, space preserved
+                        stripped = data.strip()     # used only for control checks
+                        if stripped.startswith("[TURN_ID]"):
+                            server_tid = stripped[9:].strip()
                             if server_tid != turn_id:
                                 return
                             stream_confirmed = True
                             continue
-                        if data == "[DONE]":
+                        if stripped == "[DONE]":
                             break
-                        if data in ("[TIMEOUT]", "") or data.startswith("[ERROR]"):
+                        if stripped in ("[TIMEOUT]", "") or stripped.startswith("[ERROR]"):
                             return
+                        if not stripped:
+                            continue
                         if not stream_confirmed:
                             continue
                         
