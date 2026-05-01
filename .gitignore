@@ -2,8 +2,18 @@
 __pycache__/
 *.pyc
 .env
-
+# .gitignore
+*.pt
+*.pth
+*.bin
 # cache / models
+# commercial_kv_cache_7500.pt — OPTIONAL large binary (~GB).
+# Only required when enable_cache_persistence=True (CAGConfig).
+# Generate with: python services/cag/cache_manager.py
 commercial_kv_cache_7500.pt
 cache_metadata.json
 cache_metadata_7500.json
+
+# runtime-generated folders (created automatically on first run)
+services/cag/data/
+services/cag/memory/
