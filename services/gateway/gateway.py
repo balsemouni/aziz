@@ -45,9 +45,10 @@ GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8090"))
 TTS_SPEAKER = os.getenv("TTS_SPEAKER", "tara")
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "en")
+DEFAULT_LANG = os.getenv("GATEWAY_DEFAULT_LANG", "auto")  # forwarded to STT
 
 BARGE_IN_MIN_WORDS = int(os.getenv("BARGE_IN_MIN_WORDS", "1"))
-BARGE_IN_COOLDOWN_S = float(os.getenv("BARGE_IN_COOLDOWN_S", "0.5"))
+BARGE_IN_COOLDOWN_S = float(os.getenv("BARGE_IN_COOLDOWN_S", "0.05"))  # STT handles real debouncing
 ECHO_TAIL_GUARD_S = float(os.getenv("ECHO_TAIL_GUARD_S", "0.3"))
 STT_SILENCE_MS = float(os.getenv("STT_SILENCE_MS", "500"))
 
@@ -72,7 +73,8 @@ TEST_MODE = os.getenv("TEST_MODE", "0").strip() in ("1", "true", "yes")
 # Parallel streaming settings
 MAX_CONCURRENT_TTS = int(os.getenv("MAX_CONCURRENT_TTS", "3"))  # Max parallel TTS tasks
 MIN_SENTENCE_LENGTH = int(os.getenv("MIN_SENTENCE_LENGTH", "2"))  # Min words for TTS
-SENTENCE_TIMEOUT_S = float(os.getenv("SENTENCE_TIMEOUT_S", "0.5"))  # Force flush after timeout
+SENTENCE_TIMEOUT_S = float(os.getenv("SENTENCE_TIMEOUT_S", "0.3"))  # Force flush after timeout
+MIN_CLAUSE_WORDS   = int(os.getenv("MIN_CLAUSE_WORDS", "10"))       # Flush on , ; : after this many words
 TTS_PCM_SAMPLE_RATE = int(os.getenv("TTS_PCM_SAMPLE_RATE", "22050"))  # Piper output rate (int16 = 2 bytes/sample)
 
 logging.basicConfig(
@@ -108,43 +110,59 @@ class State(Enum):
 
 # ─── Ultra-fast sentence splitting for parallel streaming ───────────────────
 
+# Sentence-ending punctuation, including French «…»/guillemets-aware closers.
+# NBSP (\u00A0) and NARROW NBSP (\u202F) precede ?!:; in French typography —
+# we treat them like ordinary spaces.
+_SENTENCE_END_CHARS = ".!?…»"
+_FR_NBSP_CHARS      = "\u00A0\u202F"
+# Lower-case abbreviation set (English + a few French ones that end in '.').
+_ABBREV = {
+    "dr", "mr", "ms", "mrs", "prof", "rev", "st", "ave",
+    "mme", "mlle", "etc", "p.s", "n.b", "cf",
+}
+
 def is_sentence_boundary(text: str, idx: int) -> bool:
-    """Check if position idx is a sentence boundary."""
+    """Check if position idx is a sentence boundary (en + fr aware)."""
     if idx >= len(text) - 1:
         return False
     char = text[idx]
-    next_char = text[idx + 1] if idx + 1 < len(text) else ''
-    
-    # Check for punctuation
-    if char in '.!?':
-        # Don't split on abbreviations like "Dr.", "Mr.", etc.
-        if idx > 0 and text[idx-1].isupper() and idx + 1 < len(text) and text[idx+1].isspace():
-            # Check if it's an abbreviation
-            if idx > 1 and text[idx-2].isalpha():
-                # Common abbreviations
-                abbrev = text[max(0, idx-3):idx]
-                if abbrev.lower() in {'dr', 'mr', 'ms', 'mrs', 'prof', 'rev', 'st', 'ave'}:
-                    return False
-        return True
-    return False
+
+    if char not in _SENTENCE_END_CHARS:
+        return False
+
+    # Look-ahead: must be followed by whitespace (incl. NBSP) or end of string.
+    nxt = text[idx + 1] if idx + 1 < len(text) else ''
+    if nxt and not (nxt.isspace() or nxt in _FR_NBSP_CHARS or nxt in '«"\''):
+        return False
+
+    # Don't split on common abbreviations like "Dr.", "Mme.", "etc."
+    if char == '.':
+        # Walk back to grab the alpha run before the dot
+        j = idx - 1
+        while j >= 0 and (text[j].isalpha() or text[j] == '.'):
+            j -= 1
+        token = text[j + 1: idx].lower().rstrip('.')
+        if token in _ABBREV:
+            return False
+    return True
 
 def split_into_sentences_immediate(text: str) -> List[str]:
-    """Split text into sentences IMMEDIATELY on boundaries."""
+    """Split text into sentences IMMEDIATELY on boundaries (en + fr)."""
     if not text:
         return []
-    
+
     sentences = []
     current = []
-    
+
     for i, char in enumerate(text):
         current.append(char)
-        
+
         if is_sentence_boundary(text, i):
             sentence = ''.join(current).strip()
             if sentence:
                 sentences.append(sentence)
                 current = []
-    
+
     # Don't return incomplete sentence
     return sentences
 
@@ -502,6 +520,9 @@ class GatewaySession:
         self.sid = str(uuid.uuid4())[:8]
         self.state = State.IDLE
         self._running = True
+        # Per-session language (en|fr|auto) negotiated at /ws connect.
+        # Forwarded to STT via ?lang= and to TTS via the request payload.
+        self.lang: str = DEFAULT_LANG
         
         self._audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         self._query_q: asyncio.Queue = asyncio.Queue()
@@ -545,6 +566,24 @@ class GatewaySession:
         # consumes & resets this flag.
         self._stt_buf_invalidate: bool = False
 
+        # ── A2 dual-trigger: predicted barge-in soft-mute ────────────────
+        # Set True the instant STT emits {"type":"barge_in_predicted"}.
+        # While True, _bsend drops outgoing TTS PCM frames so the user
+        # immediately stops hearing the AI talk over them.  Cleared by:
+        #   • a confirmed barge_in (which fully tears down TTS+CAG), or
+        #   • _do_barge_in_immediate (defensive), or
+        #   • the predict_unmute watchdog if no real word follows.
+        self._audio_muted: bool = False
+        self._predict_unmute_task: Optional[asyncio.Task] = None
+
+        # ── A4: multi-interrupt safety ───────────────────────────────────
+        # Serialises overlapping cancel/start transitions so a barge-in
+        # arriving DURING another barge-in's cleanup can't race with it.
+        # Combined with _current_turn_id invalidation this guarantees the
+        # last user utterance is always the one answered.
+        self._turn_lock: asyncio.Lock = asyncio.Lock()
+        self._turn_seq: int = 0  # monotonic counter for diagnostics
+
         log.info(f"[{self.sid}] session created")
     
     # ── Safe send helpers ─────────────────────────────────────────────────────
@@ -556,10 +595,53 @@ class GatewaySession:
             pass
     
     async def _bsend(self, data: bytes):
+        # A2: predicted barge-in mutes outgoing audio without tearing down
+        # the TTS/CAG stack.  If the prediction is confirmed by a real
+        # word, _do_barge_in_immediate runs next and cleans everything up;
+        # otherwise the predict_unmute watchdog clears the flag and the
+        # remaining audio continues flowing.
+        if self._audio_muted:
+            return
         try:
             await self.ws.send_bytes(data)
         except Exception:
             pass
+
+    async def _broadcast_tts_cancel(self):
+        """
+        Send a {"type":"cancel"} JSON frame to every TTS WebSocket we own
+        (single + pool) so any in-flight synth aborts immediately at the
+        next chunk boundary.  Connections that respond cleanly stay in the
+        pool; broken ones are closed and replaced by the pool manager.
+        """
+        cancel_frame = json.dumps({"type": "cancel"})
+        targets = []
+        if self._tts_ws is not None:
+            targets.append(self._tts_ws)
+        # Drain pool — any healthy connections get the cancel frame and are
+        # then put back; broken ones are dropped and pool manager refills.
+        drained = []
+        while not self._tts_pool.empty():
+            try:
+                drained.append(self._tts_pool.get_nowait())
+            except Exception:
+                break
+        targets.extend(drained)
+        for ws in targets:
+            try:
+                await ws.send(cancel_frame)
+            except Exception:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                continue
+        # Re-queue the pool connections we cancelled (still usable for next req)
+        for ws in drained:
+            try:
+                await self._tts_pool.put(ws)
+            except Exception:
+                pass
     
     # ── Entry ─────────────────────────────────────────────────────────────────
     
@@ -695,17 +777,88 @@ class GatewaySession:
                 await self._jsend({"type": "session_reset", "reason": "idle_timeout"})
     
     # ── Barge-in ──────────────────────────────────────────────────────────────
-    
+
+    async def _cancel_tts_for_barge_in(self):
+        """
+        Phase-1 barge-in: stop TTS audio immediately so the user isn't heard
+        over by the AI.  CAG is NOT cancelled yet — we wait for an actual
+        transcribed segment before committing to the full barge-in.
+
+        If no words are transcribed (too brief / false VAD spike), the CAG
+        stream keeps running and the AI response is preserved.
+        If words arrive as segment[barge_in=True], the segment handler calls
+        _do_barge_in_immediate() which closes CAG and sends the new query.
+        """
+        async with self._turn_lock:
+            await self._cancel_tts_for_barge_in_unlocked()
+
+    async def _cancel_tts_for_barge_in_unlocked(self):
+        log.info(f"[{self.sid}] 🎤 Barge-in: TTS stopped — waiting for transcribed words")
+
+        # Abort in-flight TTS tasks (turn_id mismatch makes them exit cleanly)
+        self._current_turn_id = None
+        for task in self._active_tts_tasks:
+            if not task.done():
+                task.cancel()
+        self._active_tts_tasks.clear()
+        _drain_q(self._sentence_queue)
+
+        # Send hard cancel to any currently-checked-out TTS connection so
+        # the synth aborts mid-sentence (vs draining all remaining audio).
+        await self._broadcast_tts_cancel()
+
+        if self._tts_ws:
+            try:
+                await self._tts_ws.close()
+            except Exception:
+                pass
+            self._tts_ws = None
+
+        _drain_q(self._tts_pcm_q)
+        _drain_q(self._stt_ref_q)
+
+        if self._open_mic_task and not self._open_mic_task.done():
+            self._open_mic_task.cancel()
+        self._open_mic_task = None
+        self._tts_pcm_bytes_this_turn = 0
+        self._tts_stopped_at = time.monotonic()
+        self._echo_gate.tts_stopped()
+
+        # Open mic immediately so STT starts capturing the user's words
+        self._stt_ctrl_q.put_nowait(
+            b'\x02' + json.dumps({"type": "ai_state", "speaking": False}).encode()
+        )
+
+        # Tell client to drop buffered audio and show barge-in UI indicator
+        await self._jsend({"type": "clear_audio"})
+        await self._jsend({"type": "barge_in"})
+        # NOTE: self.state intentionally stays SPEAKING/THINKING so the segment
+        # handler can detect we are still mid-turn and call _do_barge_in_immediate().
+
     async def _do_barge_in_immediate(self):
-        now = time.monotonic()
-        if now < self._barge_in_until:
+        # A4: serialise overlapping barge-ins.  If a second barge-in arrives
+        # while the first is still running cleanup, it queues here, then
+        # runs to completion — guaranteeing the LATEST user utterance wins
+        # and avoiding races on _current_turn_id / _cag_ws / _tts_ws.
+        async with self._turn_lock:
+            await self._do_barge_in_unlocked()
+
+    async def _do_barge_in_unlocked(self):
+        # Skip only if we're already mid-barge-in with no new turn started yet
+        # (dedup guard — prevents double-firing from the same detection event).
+        # A *new* barge-in while the previous one's segment is already queued
+        # (state back to THINKING/SPEAKING) must always proceed.
+        if self._barge_in and self._current_turn_id is None:
+            log.debug(f"[{self.sid}] _do_barge_in_immediate: already active, skip")
             return
-        
-        log.info(f"[{self.sid}] ⚡ BARGE-IN")
-        
+
+        self._turn_seq += 1
+        log.info(f"[{self.sid}] ⚡ BARGE-IN #{self._turn_seq}")
+
         if self._lat.current:
             self._lat.current.barge_in = True
-        
+
+        now = time.monotonic()
         self._barge_in = True
         self._barge_in_until = now + BARGE_IN_COOLDOWN_S
         self.state = State.IDLE  # Reset immediately so finally blocks see correct state
@@ -721,6 +874,10 @@ class GatewaySession:
         
         # Clear sentence queue (legacy drain — kept for safety)
         _drain_q(self._sentence_queue)
+
+        # A3: blast a cancel frame to all TTS connections so they abort
+        # synthesis instantly instead of draining the remaining sentence.
+        await self._broadcast_tts_cancel()
         
         # Close any single TTS connection (pooled connections are managed
         # separately by the pool manager).
@@ -731,26 +888,31 @@ class GatewaySession:
                 pass
             self._tts_ws = None
         
-        # Send explicit cancel to CAG so the LLM aborts in-flight (within one
-        # chunk) — closing the WS alone is not enough because Ollama keeps
-        # generating until it notices the connection drop. Keep the WS open
-        # so the next turn can reuse it without reconnect latency.
+        # Send cancel to CAG but KEEP the WebSocket open — closing it forces
+        # a full TCP+WS reconnect for every barge-in (adds ~50-200ms delay).
+        # Instead: the cancel frame makes CAG abort the LLM generator and
+        # send a "done" frame; _stream_cag_immediate drains those leftover
+        # frames and returns cleanly; _cag_loop then sends the new barge-in
+        # query on the SAME connection with zero reconnect overhead.
         cag_ws = self._cag_ws
         if cag_ws is not None:
             cancel_tid = self._lat.current.turn_id if self._lat.current else None
             try:
                 await cag_ws.send(json.dumps({"type": "cancel", "turn_id": cancel_tid}))
-            except Exception as e:
-                log.debug(f"[{self.sid}] CAG cancel send failed: {e}")
-                # Fall back to closing the connection if cancel could not be sent.
-                try:
-                    await cag_ws.close()
-                except Exception:
-                    pass
-                self._cag_ws = None
-        
+            except Exception:
+                pass
+            # Do NOT close cag_ws here.
+
+        # Drain stale pending queries so the barge-in utterance is the next
+        # (and only) query the CAG loop processes after reconnecting.
+        _drain_q(self._query_q)
+
         # Clear any pending PCM
         _drain_q(self._tts_pcm_q)
+
+        # Stop feeding stale TTS audio to the STT VoiceGate fingerprint so
+        # the centroid doesn't keep drifting with cancelled-turn audio.
+        _drain_q(self._stt_ref_q)
 
         # Cancel any pending mic-open task — open mic immediately on barge-in
         if self._open_mic_task and not self._open_mic_task.done():
@@ -769,6 +931,14 @@ class GatewaySession:
         # cancelled sentence does not keep playing after the user has barged in.
         await self._jsend({"type": "clear_audio"})
         await self._jsend({"type": "barge_in"})
+
+        # A2: clear the predicted-mute (the confirmed barge-in supersedes it).
+        if self._predict_unmute_task and not self._predict_unmute_task.done():
+            self._predict_unmute_task.cancel()
+        self._predict_unmute_task = None
+        if self._audio_muted:
+            self._audio_muted = False
+            await self._jsend({"type": "audio_mute", "muted": False})
     
     # ─── TTS WebSocket pool manager ───────────────────────────────────────────
     # On startup, creates 3 TTS connections
@@ -906,19 +1076,41 @@ class GatewaySession:
             # ── Phase 1: Synthesize — collect all audio while TTS generates ──
             audio_buf: List[bytes] = []
             got_first = False
+            seen_any_frame = False  # tracks whether we've consumed *any* frame yet
             async for frame in tts_ws:
                 if self._barge_in or self._current_turn_id != turn_id:
                     break
                 if isinstance(frame, bytes):
                     if frame == b"":
                         break
-                    if frame:
-                        if not got_first:
-                            got_first = True
-                            if sentence_idx == 0:
-                                # Latency: first audio chunk arrived from TTS
-                                self._lat.on_first_audio()
-                        audio_buf.append(frame)
+                    if not frame:
+                        continue
+                    # Meta frame is ALWAYS the first frame of a synth, prefixed
+                    # with byte 0x02. Once we've seen a non-meta frame, never
+                    # try to parse another as meta (PCM samples can legally
+                    # start with 0x02, so byte-sniffing every frame is unsafe).
+                    if not seen_any_frame and frame[:1] == b"\x02":
+                        seen_any_frame = True
+                        try:
+                            meta = json.loads(frame[1:].decode("utf-8"))
+                            if isinstance(meta, dict) and meta.get("type") == "meta":
+                                await self._jsend({
+                                    "type":        "tts_meta",
+                                    "sample_rate": meta.get("sample_rate"),
+                                    "engine":      meta.get("engine"),
+                                })
+                                continue
+                        except Exception:
+                            # Not actually a meta frame — fall through and
+                            # treat the bytes as audio.
+                            pass
+                    seen_any_frame = True
+                    if not got_first:
+                        got_first = True
+                        if sentence_idx == 0:
+                            # Latency: first audio chunk arrived from TTS
+                            self._lat.on_first_audio()
+                    audio_buf.append(frame)
 
             # Return connection to pool before the playback wait so the pool
             # stays healthy even while we wait for the previous sentence to end.
@@ -968,7 +1160,7 @@ class GatewaySession:
         
         while self._running and retries < STT_MAX_RETRIES:
             try:
-                stt_url = f"{STT_WS_URL}?sid={self.sid}"
+                stt_url = f"{STT_WS_URL}?sid={self.sid}&lang={self.lang}"
                 stt_ws = await _ws_connect(
                     stt_url, max_retries=STT_MAX_RETRIES,
                     label=f"[{self.sid}] STT",
@@ -1045,17 +1237,17 @@ class GatewaySession:
                         # that are not real, distinct user utterances.
                         if self.state in (State.SPEAKING, State.THINKING):
                             if prev:
-                                # Prefix-extension of an already-fired turn
-                                # that adds <2 new words → ignore.
-                                if cur.startswith(prev):
-                                    extra = cur[len(prev):].strip().split()
-                                    if len(extra) < 2:
-                                        log.debug(
-                                            f"[{self.sid}] suppress thin extension: {text!r}"
-                                        )
-                                        word_buf = []
-                                        silence_task = None
-                                        return
+                                # Only suppress exact duplicates.  Even one
+                                # new word ("you hear" → "you hear me") is a
+                                # real new intent — barge-in must carry the
+                                # full text to CAG, not just the partial.
+                                if cur == prev:
+                                    log.debug(
+                                        f"[{self.sid}] suppress exact-dup extension: {text!r}"
+                                    )
+                                    word_buf = []
+                                    silence_task = None
+                                    return
                             if word_count < BARGE_IN_MIN_WORDS:
                                 log.debug(
                                     f"[{self.sid}] suppress short barge-in attempt "
@@ -1101,24 +1293,48 @@ class GatewaySession:
                         kind = ev.get("type", "")
                         
                         if kind == "barge_in":
-                            # Act immediately on barge-in. Clear the partial
-                            # word buffer and cancel the in-flight silence timer
-                            # so the pre-barge-in fragment (e.g. "you") is NOT
-                            # fired as an incomplete query. After the reset the
-                            # user's full post-barge-in utterance accumulates
-                            # fresh and is sent as one complete query.
+                            # Barge-in: stop BOTH TTS and CAG immediately so
+                            # the AI cannot keep talking or generating while
+                            # the user is speaking. Barge-in text is written
+                            # as a new query the moment the STT segment arrives.
                             if not barge_triggered_this_turn:
                                 barge_triggered_this_turn = True
                                 await self._do_barge_in_immediate()
-                                _drain_q(self._query_q)
-                                # Reset accumulation so the full utterance is
-                                # captured as a single clean query, not split
-                                # across multiple fire_query calls.
                                 word_buf.clear()
                                 last_fired_text = ""
                                 if silence_task and not silence_task.done():
                                     silence_task.cancel()
                                 silence_task = None
+                            continue
+
+                        elif kind == "barge_in_predicted":
+                            # ── A2 dual-trigger: predicted (early) barge-in ──
+                            # Sustained voice during AI speech, but no real
+                            # word yet.  Mute outgoing audio instantly so the
+                            # user doesn't hear the AI talk over them.  We do
+                            # NOT cancel CAG yet — if no confirmed word
+                            # follows within a short window we just unmute
+                            # and the answer continues.
+                            if not barge_triggered_this_turn and self.state == State.SPEAKING:
+                                if not self._audio_muted:
+                                    self._audio_muted = True
+                                    await self._jsend({"type": "audio_mute", "muted": True})
+                                    log.debug(f"[{self.sid}] predicted barge-in — audio muted")
+                                # Restart the auto-unmute watchdog (~600ms).
+                                if self._predict_unmute_task and not self._predict_unmute_task.done():
+                                    self._predict_unmute_task.cancel()
+
+                                async def _auto_unmute():
+                                    try:
+                                        await asyncio.sleep(0.6)
+                                        if self._audio_muted and not barge_triggered_this_turn:
+                                            self._audio_muted = False
+                                            await self._jsend({"type": "audio_mute", "muted": False})
+                                            log.debug(f"[{self.sid}] predict mute auto-cleared")
+                                    except asyncio.CancelledError:
+                                        pass
+
+                                self._predict_unmute_task = asyncio.create_task(_auto_unmute())
                             continue
                         
                         elif kind == "word":
@@ -1148,7 +1364,16 @@ class GatewaySession:
                                 self._lat.on_stt_first_word()
                                 if silence_task and not silence_task.done():
                                     silence_task.cancel()
-                                silence_task = asyncio.create_task(_fire_query())
+                                # During a barge-in, the STT pipeline will emit a
+                                # complete `segment` event when the utterance ends.
+                                # Don't also fire a partial word-timeout query —
+                                # that would send "you hear" AND then "you hear me"
+                                # as two separate CAG queries for the same utterance.
+                                # Rely only on the segment event for the full text.
+                                if not barge_triggered_this_turn:
+                                    silence_task = asyncio.create_task(_fire_query())
+                                else:
+                                    silence_task = None
                                 # Only forward to client when the word changes (stops rapid-fire spam)
                                 if is_new_word:
                                     await self._jsend(ev)
@@ -1235,19 +1460,28 @@ class GatewaySession:
                         query_text = query
                     
                     self._cag_turn_count += 1
+                    came_from_barge_in = self._barge_in  # capture before reset
                     self._barge_in = False
                     self.state = State.THINKING
                     
                     self._lat.on_query_sent()
                     log.info(f"[{self.sid}] CAG query: {query_text!r}")
                     await self._jsend({"type": "thinking", "turn_id": turn_id})
-                    
+
+                    # Send reset=True on the very first turn and on any turn
+                    # that immediately follows a barge-in.  This clears CAG's
+                    # in-flight context so the partial from the previous turn
+                    # ("you hear") doesn't bleed into the barge-in reply
+                    # ("you hear me").
+                    do_reset = self._cag_turn_count == 1 or came_from_barge_in
+                    self._barge_in = False  # consumed — clear for next turn
+
                     try:
                         await cag_ws.send(json.dumps({
-                            "type": "query",
+                            "type":    "query",
                             "turn_id": turn_id,
                             "message": query_text,
-                            "reset": self._cag_turn_count == 1,
+                            "reset":   do_reset,
                         }))
                     except Exception as e:
                         log.error(f"[{self.sid}] CAG send error: {e}")
@@ -1259,15 +1493,19 @@ class GatewaySession:
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                retries += 1
                 self._cag_ws = None
-                log.warning(f"[{self.sid}] CAG WS disconnected ({e}), retry {retries}/{CAG_MAX_RETRIES}")
+                if self._barge_in:
+                    # Barge-in intentionally closed the CAG WS — don't burn a
+                    # retry. Reconnect immediately to serve the new query.
+                    log.info(f"[{self.sid}] CAG WS closed (barge-in) — reconnecting")
+                    retries = 0
+                else:
+                    retries += 1
+                    log.warning(f"[{self.sid}] CAG WS disconnected ({e}), retry {retries}/{CAG_MAX_RETRIES}")
                 if retries < CAG_MAX_RETRIES:
-                    # Immediate reconnect after barge-in; backoff for unexpected drops
                     delay = 0.0 if self._barge_in else min(2 ** retries, 10)
                     if delay > 0:
                         await asyncio.sleep(delay)
-                    await self._cag_loop_http_fallback()
     
     async def _stream_cag_immediate(self, cag_ws, turn_id: str):
         """Stream CAG tokens and IMMEDIATELY send complete sentences to TTS."""
@@ -1295,8 +1533,8 @@ class GatewaySession:
         try:
             async for raw_frame in cag_ws:
                 if self._barge_in:
-                    log.info(f"[{self.sid}] CAG stream aborted (barge-in)")
-                    return
+                    log.info(f"[{self.sid}] CAG stream aborted (barge-in) — draining")
+                    break
                 
                 try:
                     frame = json.loads(raw_frame) if isinstance(raw_frame, (str, bytes)) else {}
@@ -1338,12 +1576,21 @@ class GatewaySession:
                 
                 # Check for complete sentence IMMEDIATELY
                 is_boundary = False
-                if token.endswith(('.', '!', '?')):
-                    # Check if it's a true sentence boundary
-                    if len(current_sentence_parts) >= 2:  # At least a few tokens
+                tok_stripped = token.rstrip()
+                if tok_stripped.endswith(('.', '!', '?')):
+                    # True sentence boundary — flush even on short sentences
+                    if len(current_sentence_parts) >= 2:
                         is_boundary = True
-                
-                # Force flush if no sentence detected after timeout
+
+                # Soft clause boundary: comma / semicolon / colon after enough words.
+                # This gets TTS started early on long answers instead of waiting
+                # for a full stop or the 0.3s force-flush timeout.
+                if not is_boundary and tok_stripped.endswith((',', ';', ':')):
+                    word_count = len(_smart_join(current_sentence_parts).split())
+                    if word_count >= MIN_CLAUSE_WORDS:
+                        is_boundary = True
+
+                # Force flush if no boundary detected after timeout
                 if not is_boundary and time.monotonic() - last_flush_time > SENTENCE_TIMEOUT_S:
                     if current_sentence_parts:
                         is_boundary = True
@@ -1382,6 +1629,25 @@ class GatewaySession:
                     
                     last_flush_time = time.monotonic()
             
+            # If barge-in: drain remaining CAG frames so the WS stays clean
+            # for immediate reuse, then return (finally block still runs).
+            if self._barge_in:
+                try:
+                    drain_limit = 100  # never block forever
+                    async for drain_frame in cag_ws:
+                        if drain_limit <= 0:
+                            break
+                        drain_limit -= 1
+                        try:
+                            df = json.loads(drain_frame) if isinstance(drain_frame, (str, bytes)) else {}
+                        except Exception:
+                            df = {}
+                        if df.get("type") in ("done", "error", "timeout"):
+                            break
+                except Exception:
+                    pass
+                return  # finally runs; _cag_loop reuses the same WS immediately
+
             # Handle any remaining text
             if current_sentence_parts:
                 sentence = _smart_join(current_sentence_parts).strip()
@@ -1411,6 +1677,11 @@ class GatewaySession:
             self._text_echo_filter.feed_ai_text(full_text)
             
         except Exception as e:
+            if self._barge_in:
+                # WS error during barge-in drain — return cleanly;
+                # _cag_loop will reconnect naturally on next send().
+                log.info(f"[{self.sid}] CAG stream interrupted by barge-in: {e}")
+                return
             log.error(f"[{self.sid}] CAG stream error: {e}")
         
         finally:
@@ -1450,9 +1721,13 @@ class GatewaySession:
                             pass
                     self._tts_stopped_at = time.monotonic()
                     self._echo_gate.tts_stopped()
-                    # Tell _recv to drop any words/segments captured during AI
-                    # speech — those are echo, not the next user utterance.
-                    self._stt_buf_invalidate = True
+                    # Only invalidate the STT buffer when the AI actually played
+                    # audio that could have leaked into the mic. If TTS was
+                    # cancelled before the first frame (barge-in), playback_s==0
+                    # so there is nothing to echo-guard and we must NOT drop the
+                    # user’s barge-in words.
+                    if playback_s > 0:
+                        self._stt_buf_invalidate = True
                     log.debug(f"[{self.sid}] Mic re-opened after {playback_s:.2f}s playback")
 
                 self._open_mic_task = asyncio.create_task(_open_mic())
@@ -1637,8 +1912,15 @@ async def _gateway_startup():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     session = GatewaySession(ws)
+    # Negotiate language from the client URL: /ws?lang=fr  (default 'auto')
+    _req_lang = (ws.query_params.get("lang") or DEFAULT_LANG or "auto").strip().lower()
+    if _req_lang in ("", "auto", "en", "fr"):
+        session.lang = _req_lang or "auto"
+    else:
+        log.warning(f"[{session.sid}] unsupported lang={_req_lang!r}, falling back to auto")
+        session.lang = "auto"
     pipeline = asyncio.create_task(session.run())
-    log.info(f"[{session.sid}] client connected")
+    log.info(f"[{session.sid}] client connected  lang={session.lang!r}")
     
     if TEST_MODE:
         await ws.send_json({"type": "ready", "message": "TEST MODE — ready"})

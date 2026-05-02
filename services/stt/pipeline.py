@@ -71,12 +71,13 @@ class STTPipeline:
         barge_in_threshold: float     = 0.40,
         vad_pre_gain: float           = 5.0,
         # ASR
-        whisper_model_size: str       = "base.en",
+        whisper_model_size: str       = "small",
         overlap_seconds: float        = 0.8,
         word_gap_ms: float            = 80.0,
         max_context_words: int        = 10,
         max_history_turns: int        = 3,
         asr_min_buffer_ms: float      = 600.0,
+        language: Optional[str]       = None,   # None | "auto" | "en" | "fr" | …
         # AEC (timing-based gate)
         enable_aec: bool              = True,
         # TTSVoiceGate (acoustic fingerprint gate)
@@ -120,6 +121,36 @@ class STTPipeline:
         self._barge_in_active      = False
         self._barge_in_fired_ts    = 0.0
         self._barge_in_voice_frames = 0
+        # ── A2 dual-trigger ───────────────────────────────────────────
+        # We emit `barge_in_predicted` as soon as we see sustained voice
+        # frames during AI speech (≥ ~200 ms).  The gateway uses it to
+        # *instantly mute* the outgoing audio (zero perceived AI overlap)
+        # while leaving CAG running — if no real word follows we just
+        # un-mute and the answer is preserved.  When a confirmed word
+        # arrives we emit the legacy `barge_in` event which is the hard
+        # cancel.  This reduces dead-air on coughs/short noises.
+        self._barge_in_predict_frames = 0
+        self._barge_in_predicted_fired = False
+        # Tracks whether we've already sent {"type":"barge_in"} to the
+        # gateway for the current barge-in.  The event fires exactly once —
+        # on the first real Whisper word — so that gateway only cuts TTS
+        # when there's genuine transcribed content, not on pure noise.
+        self._barge_in_event_fired = False
+        # Voice-gate cosine ceiling above which a "predicted" event is
+        # NOT emitted (likely echo, not real speech).  Looser than the
+        # confirmed-suppress threshold so predictions stay sensitive.
+        self._predict_voice_sim_ceiling = float(
+            __import__("os").environ.get("BARGE_IN_PREDICT_VG_MAX", "0.78")
+        )
+        # VAD probability required for prediction.  Lower than the
+        # confirmed barge-in threshold so we react faster.
+        self._predict_vad_min = float(
+            __import__("os").environ.get("BARGE_IN_PREDICT_VAD_MIN", "0.55")
+        )
+        # Sustained-voice frames (~20ms each) before predicting.
+        self._predict_min_frames = int(
+            __import__("os").environ.get("BARGE_IN_PREDICT_MIN_FRAMES", "10")
+        )
 
         # Latency tracking
         self._utterance_start_ts: Optional[float] = None
@@ -141,6 +172,7 @@ class STTPipeline:
             word_gap_ms       = word_gap_ms,
             max_context_words = max_context_words,
             max_history_turns = max_history_turns,
+            language          = language,
         )
 
         # ── Gate 1: AEC timing gate ───────────────────────────────────────────
@@ -180,10 +212,21 @@ class STTPipeline:
             else:
                 self.aec.set_ai_speaking(speaking)
 
-        if not speaking:
-            self._barge_in_active       = False
+        if speaking:
+            # New AI turn starting — reset all barge-in state.
+            self._barge_in_fired_ts  = 0.0
             self._barge_in_voice_frames = 0
-            logger.debug("[pipeline] AI stopped — barge-in reset")
+            self._barge_in_predict_frames = 0
+            self._barge_in_predicted_fired = False
+            self._barge_in_event_fired = False
+        else:
+            # Do NOT reset _barge_in_active here. It must stay True until the
+            # user's post-barge-in segment is emitted in Step 6, so the
+            # VoiceGate bypass stays active for the entire utterance.
+            self._barge_in_voice_frames = 0
+            self._barge_in_predict_frames = 0
+            self._barge_in_predicted_fired = False
+            logger.debug("[pipeline] AI stopped — barge-in voice frames reset")
 
     def push_ai_reference(self, pcm: np.ndarray):
         """
@@ -209,24 +252,41 @@ class STTPipeline:
 
         # ── Step 1: AEC timing gate ────────────────────────────────────────
         # Suppress while AI is speaking + 1200ms echo tail.
-        # BARGE-IN BYPASS: once barge-in is confirmed, skip AEC entirely so
-        # the user's speech reaches VAD/ASR at full amplitude. Without this,
-        # the AEC zeros out the mic (spectral subtraction on the TTS reference)
-        # making VAD see silence and ASR produce nothing.
-        if self.aec and not self._barge_in_active:
+        # AEC always runs — after barge-in fires we call aec.stop_immediate()
+        # so the gate doesn't suppress, but spectral subtraction still cleans
+        # residual echo from the mic before it reaches VAD/ASR.
+        if self.aec:
             cleaned, aec_suppressed = self.aec.process(audio_chunk)
         else:
             cleaned, aec_suppressed = audio_chunk, False
 
         # ── Step 2: TTSVoiceGate acoustic fingerprint check ───────────────
-        # Only run if the AEC didn't already suppress AND the gate is enrolled.
-        # Catches echo that slips past the timing window.
+        # We need two separate uses of the voice gate:
+        #
+        # A) SIMILARITY on RAW audio  — used by barge-in Step 4 to decide
+        #    "is this the user or the AI's own echo?"  Must use audio_chunk
+        #    (before AEC) because AEC zeros the cleaned signal while the AI
+        #    is speaking, making cleaned→cosine always 0 and useless.
+        #
+        # B) SUPPRESSION on CLEANED audio — used to drop echo that slips
+        #    past the AEC timing window (reverb tail etc).  Only applied
+        #    when AEC didn't already suppress.
+        #
+        # If the gate is not yet enrolled (< 8 frames of TTS audio seen),
+        # voice_sim = 1.0 so barge-in Step 4 refuses to fire — better to
+        # miss the very first barge-in than to have the AI cut itself on echo.
         voice_gate_suppressed = False
-        voice_sim             = 0.0
+        voice_gate_ready      = bool(self.voice_gate and self.voice_gate.is_ready)
 
-        if not aec_suppressed and self.voice_gate and self.voice_gate.is_ready:
-            # Use stricter threshold during barge-in to protect real speech
-            voice_gate_suppressed, voice_sim = self.voice_gate.check(
+        # A) Similarity on RAW mic audio (always, regardless of AEC)
+        if voice_gate_ready:
+            voice_sim = self.voice_gate.similarity(audio_chunk)
+        else:
+            voice_sim = 1.0   # conservative: treat as potential echo
+
+        # B) Suppression check on cleaned audio (only when AEC didn't suppress)
+        if not aec_suppressed and voice_gate_ready:
+            voice_gate_suppressed, _ = self.voice_gate.check(
                 cleaned, ai_speaking=self._ai_speaking
             )
             if voice_gate_suppressed and not self._barge_in_active:
@@ -243,7 +303,10 @@ class STTPipeline:
         # VAD runs even during AEC suppression to detect barge-in.
         # But if voice gate suppressed it (echo after timing window), skip VAD
         # to avoid false voice detections on residual echo.
-        if voice_gate_suppressed:
+        # BARGE-IN BYPASS: while _barge_in_active, never drop to VAD/ASR — the
+        # user is speaking and their voice must reach Whisper regardless of
+        # VoiceGate similarity (mic may carry residual echo mixed with user voice).
+        if voice_gate_suppressed and not self._barge_in_active:
             return events
 
         audio, is_voice, prob, rms, silence_event = self.vad.process_chunk(
@@ -251,33 +314,75 @@ class STTPipeline:
         )
 
         # ── Step 4: Barge-in detection ─────────────────────────────────────
+        # KEY RULE: only the USER barges in.  The AI must never interrupt
+        # itself on its own echo.  We require a fresh cosine measurement
+        # showing the mic content is NOT TTS-like before firing anything.
         if self._ai_speaking:
-            if is_voice:
+            # Cosine-similarity gate: if the voice gate is enrolled, only
+            # accept audio that looks like the USER (low cosine vs AI
+            # centroid).  If the gate is not yet enrolled we cannot
+            # distinguish echo from user voice, so we allow any voice
+            # through — the mic must ALWAYS be ready to pick up the user.
+            is_user_voice = (
+                not voice_gate_ready
+                or voice_sim < self._predict_voice_sim_ceiling
+            )
+
+            if is_voice and is_user_voice:
                 self._barge_in_voice_frames += 1
             else:
                 self._barge_in_voice_frames = 0
 
-            now         = time.monotonic()
-            cooldown_ok = (now - self._barge_in_fired_ts) * 1000 > self.barge_in_cooldown_ms
-            debounce_ok = self._barge_in_voice_frames >= self.barge_in_debounce
-            threshold_ok = prob >= self.barge_in_threshold
+            # ── A2: predicted barge-in (early, soft, reversible) ──────
+            if (
+                not self._barge_in_predicted_fired
+                and not self._barge_in_active
+                and prob >= self._predict_vad_min
+                and is_user_voice
+            ):
+                self._barge_in_predict_frames += 1
+                if self._barge_in_predict_frames >= self._predict_min_frames:
+                    self._barge_in_predicted_fired = True
+                    logger.info(
+                        f"[pipeline] ⚡ BARGE-IN predicted  "
+                        f"prob={prob:.3f}  voice_sim={voice_sim:.3f}  "
+                        f"frames={self._barge_in_predict_frames}"
+                    )
+                    events.append({
+                        "type":      "barge_in_predicted",
+                        "prob":      round(prob, 3),
+                        "voice_sim": round(voice_sim, 3),
+                    })
+            elif not is_voice or not is_user_voice:
+                self._barge_in_predict_frames = max(
+                    0, self._barge_in_predict_frames - 2
+                )
 
-            if threshold_ok and debounce_ok and cooldown_ok and not self._barge_in_active:
-                self._barge_in_active    = True
-                self._barge_in_fired_ts  = now
-                self._utterance_start_ts = now
+            # ── Instant barge-in: VAD + voice_sim is enough ──────────
+            # voice_sim < ceiling already filters AI echo.  We do NOT
+            # wait for Whisper to return a word — Whisper works on
+            # accumulated chunks (several seconds) so waiting for it
+            # means TTS/CAG keep running the entire time the user speaks.
+            # Emit barge_in NOW so gateway cuts TTS+CAG immediately.
+            # Transcription continues and the segment event delivers the
+            # actual text once the user stops talking.
+            if is_voice and is_user_voice and not self._barge_in_active:
+                self._barge_in_active      = True
+                self._barge_in_fired_ts    = time.monotonic()
+                self._utterance_start_ts   = time.monotonic()
+                self._barge_in_event_fired = True
                 self._words_this_utterance.clear()
                 self.realtime_asr.flush()
+                if self.aec:
+                    self.aec.stop_immediate()
                 logger.info(
-                    f"[pipeline] ⚡ BARGE-IN fired  "
-                    f"prob={prob:.3f}  frames={self._barge_in_voice_frames}  "
-                    f"voice_sim={voice_sim:.3f}"
+                    f"[pipeline] ⚡ BARGE-IN fired instantly  "
+                    f"prob={prob:.3f}  voice_sim={voice_sim:.3f}"
                 )
                 events.append({
-                    "type":         "barge_in",
-                    "prob":         round(prob, 3),
-                    "voice_sim":    round(voice_sim, 3),
-                    "words_so_far": len(self._words_this_utterance),
+                    "type":      "barge_in",
+                    "prob":      round(prob, 3),
+                    "voice_sim": round(voice_sim, 3),
                 })
 
             if not self._barge_in_active:
@@ -368,7 +473,18 @@ class STTPipeline:
                 )
 
                 self._barge_in_active       = False
+                self._barge_in_event_fired  = False
                 self._barge_in_voice_frames = 0
+
+            else:
+                # No words transcribed — reset barge-in state so VoiceGate
+                # bypass doesn't persist indefinitely.
+                if self._barge_in_active:
+                    logger.debug("[pipeline] barge-in silence with no words — resetting")
+                self._barge_in_active       = False
+                self._barge_in_event_fired  = False
+                self._barge_in_voice_frames = 0
+                self._utterance_start_ts    = None
 
             self._words_this_utterance.clear()
 
@@ -402,6 +518,7 @@ class STTPipeline:
         self._words_this_utterance.clear()
         self._ai_speaking           = False
         self._barge_in_active       = False
+        self._barge_in_event_fired  = False
         self._barge_in_voice_frames = 0
         self._barge_in_fired_ts     = 0.0
         self._utterance_start_ts    = None

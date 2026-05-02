@@ -75,13 +75,14 @@ class RealTimeChunkASR:
 
     def __init__(
         self,
-        model_size:        str   = "base.en",
+        model_size:        str   = "small",
         device:            str   = "cuda",
         sample_rate:       int   = 16000,
         overlap_seconds:   float = OVERLAP_S,
         word_gap_ms:       float = 60.0,      # kept for API compat only
         max_context_words: int   = MAX_PROMPT_WORDS,
         max_history_turns: int   = MAX_HISTORY_TURNS,
+        language:          Optional[str] = None,   # None | "en" | "fr" | "auto"
     ):
         compute_type = "int8_float16" if device == "cuda" else "int8"
         print(f"[RealTimeASR] Loading Whisper '{model_size}' on "
@@ -90,6 +91,12 @@ class RealTimeChunkASR:
                                         compute_type=compute_type)
         self.sample_rate = sample_rate
         self.device      = device
+        # v2.1: per-session language.  None or "auto" → Whisper auto-detect.
+        # Two-letter ISO codes ("en", "fr", …) are passed straight through
+        # to faster-whisper which forwards them to the decoder language token.
+        self._language: Optional[str] = (
+            None if (language in (None, "", "auto")) else language.lower()
+        )
 
         self._overlap_samples  = int(overlap_seconds * sample_rate)
         self._context_samples  = int(CONTEXT_S * sample_rate)
@@ -224,6 +231,7 @@ class RealTimeChunkASR:
                 initial_prompt             = prompt or None,
                 condition_on_previous_text = False,
                 temperature                = 0.0,
+                language                   = self._language,
             )
         except Exception as exc:
             print(f"[RealTimeASR] Whisper error: {exc}")
@@ -338,6 +346,14 @@ class RealTimeChunkASR:
 
     def _build_prompt(self) -> str:
         parts: List[str] = []
+        # ── B4: small per-language biasing string ────────────────────────
+        # Whisper conditions on the prompt; a one-line cue in the target
+        # language nudges the decoder into that language and improves
+        # punctuation/casing for short utterances. None for "auto".
+        if self._language == "fr":
+            parts.append("Conversation en français.")
+        elif self._language == "en":
+            parts.append("English conversation.")
         for turn in self._history:
             role = "User" if turn["role"] == "user" else "Assistant"
             parts.append(f"{role}: {turn['text']}")

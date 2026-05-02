@@ -237,8 +237,8 @@ class CAGSystemFreshSession:
           4. Hard cap at LOGIC_MAX_CHARS (160) — split at last word boundary.
           5. Tail flush at end of stream.
         """
-        _RE_SENTENCE_END = _re.compile(r'(?<=[^\d])([.!?]+["\']?)(?=\s|$)')
-        _RE_CLAUSE_BREAK = _re.compile(r'([,;:—–])\s')
+        _RE_SENTENCE_END = _re.compile(r'(?<=[^\d])([.!?…]+["\'»]?)(?=[\s\u00A0\u202F]|$)')
+        _RE_CLAUSE_BREAK = _re.compile(r'([,;:—–])[\s\u00A0\u202F]')
         _RE_STARTS_PUNCT = _re.compile(r'^[\s,\.!?;:\)\]\}\'\"\\u2019\\u2018\\u201c\\u201d\-]')
 
         FIRST_CHUNK_CHARS = 30

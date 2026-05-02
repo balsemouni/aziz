@@ -132,6 +132,7 @@ def synthesize(
     text: str,
     voice_name: Optional[str] = None,
     emotion: Optional[str] = None,
+    speed: Optional[float] = None,
 ) -> bytes:
     """
     Synthesize *text* and return raw 16-bit signed-integer PCM bytes.
@@ -140,25 +141,43 @@ def synthesize(
         text:       The text to synthesize.
         voice_name: Speaker/voice name (mapped via VOICE_MODELS).
         emotion:    Optional emotion tag (mapped to speed via EMOTION_SPEED).
+        speed:      Optional explicit speed multiplier (e.g. 1.1 = 10% faster).
 
     Returns:
         Raw PCM bytes (signed 16-bit little-endian, mono).
         Sample rate can be queried with piper_engine.sample_rate(voice_name).
     """
+    return b"".join(
+        chunk for chunk in stream(text, voice_name=voice_name, emotion=emotion, speed=speed)
+    )
+
+
+def stream(
+    text: str,
+    voice_name: Optional[str] = None,
+    emotion: Optional[str] = None,
+    speed: Optional[float] = None,
+):
+    """
+    Generator yielding raw PCM byte chunks as Piper produces them.
+
+    Used by the streaming WebSocket path so first audio reaches the client
+    without waiting for the full sentence to finish synthesizing.
+    """
     if not text or not text.strip():
-        return b""
+        return
 
     model_filename = _resolve_voice(voice_name)
     voice = _load_voice(model_filename)
     length_scale = _resolve_length_scale(emotion)
+    if speed and speed > 0:
+        # speed > 1 → faster → smaller length_scale
+        length_scale = max(0.5, min(2.0, length_scale / float(speed)))
 
     from piper.config import SynthesisConfig
 
     syn_config = SynthesisConfig(length_scale=length_scale)
-    chunks: list[bytes] = []
     for chunk in voice.synthesize(text, syn_config=syn_config):
         data = chunk.audio_int16_bytes
         if data:
-            chunks.append(data)
-
-    return b"".join(chunks)
+            yield data

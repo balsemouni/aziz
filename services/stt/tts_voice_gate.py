@@ -125,8 +125,8 @@ class TTSVoiceGate:
     def __init__(
         self,
         sample_rate: int       = 16000,
-        detection_threshold: float = 0.70,   # sim >= this → suppress
-        barge_in_threshold:  float = 0.82,   # higher bar while ai_speaking
+        detection_threshold: float = 0.65,   # sim >= this → suppress (A6: relaxed)
+        barge_in_threshold:  float = 0.75,   # higher bar while ai_speaking (A6: relaxed)
         min_enroll_frames:   int   = 8,      # min frames before gate activates
         enabled:             bool  = True,
     ):
@@ -274,6 +274,26 @@ class TTSVoiceGate:
             )
 
         return suppressed, sim
+
+    # ── Similarity-only measurement (no suppression decision) ─────────────────
+
+    def similarity(self, audio: np.ndarray) -> float:
+        """
+        Return cosine similarity of *audio* vs the enrolled AI-voice centroid,
+        without making any suppression decision.
+
+        Use this on the RAW mic audio (before AEC cleaning) to get an honest
+        measure of how much the mic content resembles the AI voice — even
+        while the AEC is zeroing the cleaned signal.
+
+        Returns 0.0 when the gate is not yet enrolled.
+        """
+        if not self.enabled or not self._is_ready or len(audio) == 0:
+            return 0.0
+        feat = self._log_mel(audio)
+        sim  = max(0.0, self._cosine_sim(feat, self._centroid))
+        self.last_similarity = sim
+        return sim
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

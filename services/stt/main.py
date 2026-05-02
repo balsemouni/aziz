@@ -57,7 +57,11 @@ except ImportError:
 HOST                 = os.getenv("STT_HOST",              "0.0.0.0")
 PORT                 = int(os.getenv("STT_PORT",          "8001"))
 SAMPLE_RATE          = int(os.getenv("SAMPLE_RATE",       "16000"))
-WHISPER_MODEL        = os.getenv("WHISPER_MODEL",         "base.en")
+WHISPER_MODEL        = os.getenv("WHISPER_MODEL",         "small")
+# v3.3 (multilingual overhaul): default is `small` (multilingual) so
+# en-US + fr-FR both work out of the box.  Override with WHISPER_MODEL=base.en
+# for English-only legacy behaviour.
+DEFAULT_LANG         = os.getenv("STT_DEFAULT_LANG",       "auto")  # auto|en|fr|...
 DEVICE               = os.getenv("DEVICE",                "")
 
 VAD_IDLE_THRESH      = float(os.getenv("VAD_IDLE_THRESH", "0.15"))
@@ -74,6 +78,7 @@ ENABLE_VOICE_GATE    = os.getenv("ENABLE_VOICE_GATE",    "true").lower()  == "tr
 ENABLE_DEEPFILTER    = os.getenv("ENABLE_DEEPFILTER",    "false").lower() == "true"
 SESSION_IDLE_TIMEOUT = float(os.getenv("SESSION_IDLE_TIMEOUT", "300.0"))
 TTS_SAMPLE_RATE      = int(os.getenv("TTS_SAMPLE_RATE", "22050"))   # Piper TTS output rate
+BARGE_IN_COOLDOWN_MS = float(os.getenv("BARGE_IN_COOLDOWN_MS", "800.0"))  # min ms between barge-ins
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -104,22 +109,24 @@ _build_executor = concurrent.futures.ThreadPoolExecutor(
 
 # ─── Pipeline / noise factory (blocking — always call in executor) ────────────
 
-def _make_pipeline() -> STTPipeline:
+def _make_pipeline(language: Optional[str] = None) -> STTPipeline:
     import torch
     device = DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
     return STTPipeline(
-        sample_rate        = SAMPLE_RATE,
-        device             = device,
-        idle_threshold     = VAD_IDLE_THRESH,
-        barge_in_threshold = VAD_BARGE_IN_THRESH,
-        vad_pre_gain       = VAD_PRE_GAIN,
-        whisper_model_size = WHISPER_MODEL,
-        overlap_seconds    = ASR_OVERLAP_S,
-        word_gap_ms        = ASR_WORD_GAP_MS,
-        max_context_words  = ASR_CONTEXT_WORDS,
-        max_history_turns  = ASR_HISTORY_TURNS,
-        enable_aec         = ENABLE_AEC,
-        enable_voice_gate  = ENABLE_VOICE_GATE,
+        sample_rate          = SAMPLE_RATE,
+        device               = device,
+        idle_threshold       = VAD_IDLE_THRESH,
+        barge_in_threshold   = VAD_BARGE_IN_THRESH,
+        vad_pre_gain         = VAD_PRE_GAIN,
+        whisper_model_size   = WHISPER_MODEL,
+        overlap_seconds      = ASR_OVERLAP_S,
+        word_gap_ms          = ASR_WORD_GAP_MS,
+        max_context_words    = ASR_CONTEXT_WORDS,
+        max_history_turns    = ASR_HISTORY_TURNS,
+        enable_aec           = ENABLE_AEC,
+        enable_voice_gate    = ENABLE_VOICE_GATE,
+        barge_in_cooldown_ms = BARGE_IN_COOLDOWN_MS,
+        language             = (language or DEFAULT_LANG),
     )
 
 
@@ -167,10 +174,10 @@ class _Session:
         self._lock = asyncio.Lock()
 
     @classmethod
-    async def create(cls, sid: str) -> "_Session":
+    async def create(cls, sid: str, language: Optional[str] = None) -> "_Session":
         """Build a session without blocking the event loop."""
         loop     = asyncio.get_event_loop()
-        pipeline = await loop.run_in_executor(_build_executor, _make_pipeline)
+        pipeline = await loop.run_in_executor(_build_executor, _make_pipeline, language)
         noise    = await loop.run_in_executor(_build_executor, _make_noise_reducer)
         return cls(sid, pipeline, noise)
 
@@ -214,24 +221,39 @@ async def stream_mux(ws: WebSocket):
     await ws.accept()
 
     sid = ws.query_params.get("sid") or str(uuid.uuid4())
+    # ── B2: per-session language ─────────────────────────────────────────
+    # Accept ?lang=en|fr|auto (default DEFAULT_LANG).  The pipeline reads
+    # this once at construction; mid-session changes flow through the
+    # `set_language` control frame below.
+    req_lang = (ws.query_params.get("lang") or DEFAULT_LANG or "auto").strip().lower()
 
     if sid in _sessions:
         # Reconnect — reuse existing session (keeps Whisper history)
         sess = _sessions[sid]
         log.info(f"[{sid}] reconnected — pipeline preserved")
+        # Allow the client to override the language on reconnect.
+        if req_lang and hasattr(sess.pipeline.realtime_asr, "_language"):
+            sess.pipeline.realtime_asr._language = (
+                None if req_lang in ("", "auto") else req_lang
+            )
     elif _warm_session is not None:
         # Claim the pre-warmed session (zero latency on first connect)
         sess = _warm_session
         sess.sid = sid
         _warm_session = None
         _sessions[sid] = sess
-        log.info(f"[{sid}] claimed pre-warmed session")
+        # Apply the requested language to the warm pipeline.
+        if hasattr(sess.pipeline.realtime_asr, "_language"):
+            sess.pipeline.realtime_asr._language = (
+                None if req_lang in ("", "auto") else req_lang
+            )
+        log.info(f"[{sid}] claimed pre-warmed session  lang={req_lang!r}")
         # Kick off building the next warm session in the background
         asyncio.create_task(_pre_warm())
     else:
         # Build a new session off the event loop (non-blocking)
-        log.info(f"[{sid}] building session (first connect — models loading)…")
-        sess = await _Session.create(sid)
+        log.info(f"[{sid}] building session  lang={req_lang!r} (first connect — models loading)…")
+        sess = await _Session.create(sid, language=req_lang)
         _sessions[sid] = sess
         log.info(f"[{sid}] session ready")
 
@@ -305,6 +327,15 @@ async def stream_mux(ws: WebSocket):
                     speaking = bool(ctrl.get("speaking", False))
                     sess.pipeline.notify_ai_speaking(speaking)
                     log.debug(f"[{sid}] ai_state speaking={speaking}")
+
+                elif mtype == "set_language":
+                    new_lang = (ctrl.get("lang") or "auto").strip().lower()
+                    if hasattr(sess.pipeline.realtime_asr, "_language"):
+                        sess.pipeline.realtime_asr._language = (
+                            None if new_lang in ("", "auto") else new_lang
+                        )
+                    log.info(f"[{sid}] language set to {new_lang!r}")
+                    await ws.send_json({"type": "language_set", "lang": new_lang})
 
                 else:
                     log.debug(f"[{sid}] unknown ctrl: {mtype!r}")

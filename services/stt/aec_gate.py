@@ -50,7 +50,13 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 GRACE_PERIOD_MS      = 100    # Short grace before first AI word reaches mic
-POST_STOP_BUFFER_MS  = 1200   # Echo tail: long enough for reverberant rooms / slow speaker drivers
+# v2.1 (barge-in overhaul): tail dropped 1200→300ms.  We rely on TTSVoiceGate
+# (acoustic-fingerprint) for residual echo suppression, and we want to
+# minimise the dead-air window during which a fresh user utterance would be
+# blocked by the AEC timing gate.  300 ms is enough for direct-path acoustic
+# echo from typical near-field speakers; longer tails are handled by the
+# fingerprint gate, which lets real human voice through.
+POST_STOP_BUFFER_MS  = int(__import__("os").environ.get("AEC_POST_STOP_MS", "300"))
 SPECTRAL_ALPHA       = 0.85   # Spectral subtraction strength (outside gate window)
 REFERENCE_QUEUE_MS   = 3000   # How much reference audio to keep
 
